@@ -1,0 +1,13 @@
+flask
+python-dotenv
+pymongo
+qdrant-client
+numpy
+Pillow
+torch
+transformers
+sentence-transformers
+python-multipart
+requests
+tqdm
+huggingface

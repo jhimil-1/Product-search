@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>AI E-commerce Chatbot</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 20px; }
+    #chat { border: 1px solid #ccc; padding: 10px; height: 400px; overflow-y: auto; }
+    .message { margin: 5px 0; }
+    .user { font-weight: bold; color: blue; }
+    .bot { font-weight: bold; color: green; }
+    .product { border: 1px solid #ddd; margin: 5px; padding: 5px; display: inline-block; width: 150px; text-align: center; }
+    .product img { width: 100px; height: 100px; object-fit: cover; }
+  </style>
+</head>
+<body>
+  <h1>AI E-commerce Chatbot</h1>
+
+  <button id="createSession">Create New Session</button>
+  <p id="sessionId"></p>
+
+  <h3>Upload Products (JSON + Images)</h3>
+  <form id="uploadForm">
+    <textarea id="productsJson" rows="6" cols="60" placeholder='[{"product_id":"1","name":"Gold Necklace","category":"Jewelry","price":"499.99","description":"Elegant gold necklace."}]'></textarea><br>
+    <input type="file" id="productImages" multiple><br>
+    <button type="submit">Upload Products</button>
+  </form>
+
+  <h3>Chat</h3>
+  <div id="chat"></div>
+  <input type="text" id="textQuery" placeholder="Ask something..." />
+  <button id="sendText">Send</button>
+  <br><br>
+  <input type="file" id="imageQuery" />
+  <button id="sendImage">Send Image</button>
+
+  <script>
+    let sessionId = "";
+
+    function addMessage(sender, text) {
+      const chatDiv = document.getElementById("chat");
+      const div = document.createElement("div");
+      div.className = "message " + sender;
+      div.innerHTML = text;
+      chatDiv.appendChild(div);
+      chatDiv.scrollTop = chatDiv.scrollHeight;
+    }
+
+    document.getElementById("createSession").onclick = async () => {
+      const res = await fetch("/create_session", { method: "POST" });
+      const data = await res.json();
+      sessionId = data.session_id;
+      document.getElementById("sessionId").innerText = "Session ID: " + sessionId;
+      addMessage("bot", "New session created: " + sessionId);
+    };
+
+    document.getElementById("uploadForm").onsubmit = async (e) => {
+      e.preventDefault();
+      if (!sessionId) { alert("Create a session first!"); return; }
+
+      const formData = new FormData();
+      formData.append("products_json", document.getElementById("productsJson").value);
+      const files = document.getElementById("productImages").files;
+      for (let i = 0; i < files.length; i++) formData.append("images", files[i]);
+
+      const res = await fetch(`/upload_products/${sessionId}`, { method: "POST", body: formData });
+      const data = await res.json();
+      addMessage("bot", "Products uploaded: " + (data.saved_images ? data.saved_images.length : 0));
+    };
+
+    document.getElementById("sendText").onclick = async () => {
+      if (!sessionId) { alert("Create a session first!"); return; }
+      const query = document.getElementById("textQuery").value;
+      addMessage("user", query);
+      const res = await fetch("/query_text", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ query, session_id: sessionId })
+      });
+      const data = await res.json();
+      addMessage("bot", data.answer);
+      if (data.images) {
+        data.images.forEach(img => {
+          addMessage("bot", `<div class="product"><img src="${img.url}" /><br>${img.description}</div>`);
+        });
+      }
+    };
+
+    document.getElementById("sendImage").onclick = async () => {
+      if (!sessionId) { alert("Create a session first!"); return; }
+      const file = document.getElementById("imageQuery").files[0];
+      if (!file) return alert("Select an image!");
+      const formData = new FormData();
+      formData.append("file", file);
+
+      const res = await fetch(`/query_image/${sessionId}`, { method: "POST", body: formData });
+      const data = await res.json();
+      addMessage("bot", data.answer);
+      if (data.images) {
+        data.images.forEach(img => {
+          addMessage("bot", `<div class="product"><img src="${img.url}" /><br>${img.description}</div>`);
+        });
+      }
+    };
+  </script>
+</body>
+</html>
