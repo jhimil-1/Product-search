@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify, send_from_directory, session, redirect, url_for
+from flask import Flask, request, jsonify, send_from_directory, session, redirect, url_for 
 from flask_cors import CORS
 import os, uuid, json, numpy as np
 from dotenv import load_dotenv
@@ -540,14 +540,74 @@ def query_text():
         return jsonify({"error": "An error occurred while processing your request"}), 500
 
 def handle_product_search(query: str, session_id: str, collection_name: str):
-    """Handle product search by text query with exact matching when possible"""
+    """Handle product search by text query with exact matching and category filtering"""
     try:
         # Verify session exists
         session_data = sessions_col.find_one({"_id": session_id})
         if not session_data or 'collection_name' not in session_data:
             return jsonify({"error": "Session not found"}), 404
         
-        # First, try to find an exact match by product name
+        # Define jewelry categories and their variations
+        jewelry_categories = {
+            'necklace': ['necklace', 'necklaces'],
+            'ring': ['ring', 'rings'],
+            'bracelet': ['bracelet', 'bracelets'],
+            'earring': ['earring', 'earrings'],
+            'anklet': ['anklet', 'anklets'],
+            'pendant': ['pendant', 'pendants'],
+            'bangle': ['bangle', 'bangles'],
+            'brooch': ['brooch', 'brooches'],
+            'choker': ['choker', 'chokers']
+        }
+        
+        # Check if query contains any jewelry category
+        query_lower = query.lower()
+        matched_categories = []
+        
+        # Find all matching categories in the query
+        for category, terms in jewelry_categories.items():
+            if any(re.search(r'\b' + re.escape(term) + r'\b', query_lower) for term in terms):
+                matched_categories.append(category)
+        
+        # If we're looking for a specific category, search within that category
+        if matched_categories:
+            # Create a query that emphasizes the category
+            boosted_query = " ".join([f"{c}" for c in matched_categories])
+            query_embedding = embed_text(boosted_query)
+            
+            # First try with strict category matching
+            results = vector_store.search(
+                collection_name=collection_name,
+                query_vector=query_embedding,
+                filter_categories=matched_categories,
+                top_k=10,
+                score_threshold=0.7  # Higher threshold for strict matching
+            )
+            
+            # If no results with strict matching, try with a lower threshold
+            if not results:
+                results = vector_store.search(
+                    collection_name=collection_name,
+                    query_vector=query_embedding,
+                    filter_categories=matched_categories,
+                    top_k=10,
+                    score_threshold=0.4
+                )
+            
+            # Filter results to ensure they match at least one of the categories
+            if results:
+                filtered_results = []
+                for result in results:
+                    payload = getattr(result, 'payload', {}) or {}
+                    result_categories = str(payload.get('category', '')).lower().split(',')
+                    # Check if any of the matched categories are in the result categories
+                    if any(cat.strip() in ' '.join(result_categories) for cat in matched_categories):
+                        filtered_results.append(result)
+                
+                if filtered_results:
+                    return format_product_results(filtered_results[:10])  # Return top 10 filtered results
+        
+        # If no category match or no results from category search, try exact match
         exact_matches = vector_store.search(
             collection_name=collection_name,
             query_text=query,
@@ -559,30 +619,24 @@ def handle_product_search(query: str, session_id: str, collection_name: str):
         if exact_matches and hasattr(exact_matches[0], 'score') and exact_matches[0].score > 0.9:
             return format_product_results([exact_matches[0]])
             
-        # If no exact match, proceed with semantic search
-        query_embedding = embed_text(query)
-        if not query_embedding:
-            return jsonify({"error": "Failed to process search query"}), 500
+        # If no exact match, proceed with regular semantic search
+        if 'query_embedding' not in locals():
+            query_embedding = embed_text(query)
+            if not query_embedding:
+                return jsonify({"error": "Failed to process search query"}), 500
             
-        # Get semantic search results
-        results = vector_store.search(
-            collection_name=collection_name,
-            query_vector=query_embedding,
-            top_k=5,
-            score_threshold=0.5  # Higher threshold for more relevant results
-        )
+            results = vector_store.search(
+                collection_name=collection_name,
+                query_vector=query_embedding,
+                top_k=5,
+                score_threshold=0.5
+            )
         
-        # If we have results, filter for high confidence matches
+        # If we have results, return them
         if results:
-            # Only keep results with high confidence (score > 0.8)
-            filtered_results = [r for r in results if hasattr(r, 'score') and r.score > 0.8]
+            return format_product_results(results)
             
-            # If we have high confidence results, return them
-            if filtered_results:
-                return format_product_results(filtered_results[:1])  # Return only top result
-                
-        # If we get here, return the original results (if any) or an empty list
-        return format_product_results(results[:1])  # Return only top result
+        return jsonify({"message": "No matching products found"}), 404
         
     except Exception as e:
         logger.error(f"Error in handle_product_search: {str(e)}", exc_info=True)
@@ -645,22 +699,39 @@ def format_product_results(results):
     
     for result in results:
         try:
-            # Handle both Qdrant result object and dictionary
+            # Handle different result formats
             if hasattr(result, 'payload') and hasattr(result, 'score'):
+                # Qdrant result object
                 payload = result.payload or {}
                 score = float(getattr(result, 'score', 0.0))
                 result_id = str(getattr(result, 'id', ''))
+            elif isinstance(result, dict):
+                # Dictionary format
+                if 'payload' in result and 'score' in result:
+                    payload = result.get('payload', {})
+                    score = float(result.get('score', 0.0))
+                    result_id = str(result.get('id', ''))
+                else:
+                    # If result is already in product format
+                    if all(k in result for k in ['name', 'price', 'category']):
+                        formatted_results.append(result)
+                        continue
+                    payload = result
+                    score = 1.0  # Default score for direct product dicts
+                    result_id = str(result.get('id', str(uuid.uuid4())))
             else:
-                payload = result.get('payload', {})
-                if not isinstance(payload, dict):
-                    payload = {}
-                score = float(result.get('score', 0.0))
-                result_id = str(result.get('id', ''))
+                logger.warning(f"Unexpected result format: {type(result)}")
+                continue
+            
+            if not isinstance(payload, dict):
+                logger.warning(f"Invalid payload type: {type(payload)}")
+                continue
             
             # Create unique identifier for deduplication
             product_key = f"{payload.get('name', '')}_{payload.get('description', '')}"
-            if product_key in seen_products:
+            if not product_key.strip('_') or product_key in seen_products:
                 continue
+                
             seen_products.add(product_key)
             
             # Convert score to percentage format
@@ -668,24 +739,28 @@ def format_product_results(results):
             
             # Extract product details with proper defaults
             product = {
-                'id': payload.get('product_id', result_id),
-                'name': str(payload.get('name', 'Unnamed Product')),
-                'description': str(payload.get('description', '')),
-                'price': str(payload.get('price', '')),
-                'category': str(payload.get('category', '')),
-                'image_url': str(payload.get('image_url', '')),
-                'score': percentage_score
+                'id': str(payload.get('product_id', result_id)),
+                'name': str(payload.get('name', 'Unnamed Product')).strip(),
+                'description': str(payload.get('description', '')).strip(),
+                'price': str(payload.get('price', 'N/A')).strip(),
+                'category': str(payload.get('category', 'Uncategorized')).strip(),
+                'image_url': str(payload.get('image_url', '')).strip(),
+                'score': round(percentage_score, 2)  # Round to 2 decimal places
             }
             
             # Ensure image path is in the correct format
-            if product['image_url'] and not product['image_url'].startswith(('http://', 'https://', '/')):
+            if (product['image_url'] and 
+                not product['image_url'].startswith(('http://', 'https://', '/'))):
                 product['image_url'] = f"/{product['image_url'].lstrip('/')}"
                 
             formatted_results.append(product)
             
         except Exception as e:
-            logger.error(f"Error formatting product result: {str(e)}", exc_info=True)
+            logger.error(f"Error formatting product result: {str(e)}\nResult: {result}", exc_info=True)
             continue
+    
+    # Sort by score in descending order
+    formatted_results.sort(key=lambda x: x.get('score', 0), reverse=True)
     
     return formatted_results
 
@@ -702,17 +777,22 @@ def query_image(session_id):
     if file.filename == '':
         return jsonify({"error": "No selected file"}), 400
         
+    # Create a unique filename to prevent collisions
+    temp_filename = f"{uuid.uuid4()}_{secure_filename(file.filename)}"
     temp_dir = os.path.join(app.config['UPLOAD_FOLDER'], 'temp')
     os.makedirs(temp_dir, exist_ok=True)
-    filepath = os.path.join(temp_dir, secure_filename(file.filename))
+    filepath = os.path.join(temp_dir, temp_filename)
     
     try:
         # Save the file temporarily
         try:
             file.save(filepath)
+            logger.info(f"Saved uploaded file to {filepath}")
+            if not os.path.exists(filepath):
+                raise Exception("File was not saved correctly")
         except Exception as e:
             logger.error(f"Error saving temporary file: {str(e)}")
-            return jsonify({"error": "Failed to process uploaded file"}), 500
+            return jsonify({"error": "Failed to save uploaded file"}), 500
         
         try:
             # Get the collection name for this session
@@ -738,13 +818,43 @@ def query_image(session_id):
                 # Process the uploaded image
                 image = Image.open(filepath).convert("RGB")
                 
-                # Process image through CLIP
-                inputs = query_image.processor(images=image, return_tensors="pt", padding=True)
+                # STEP 1: Detect product category from the image using CLIP text-image similarity
+                jewelry_categories = [
+                    "necklace", "ring", "bracelet", "earring", "anklet", 
+                    "pendant", "bangle", "brooch", "choker", "watch"
+                ]
+                
+                # Create text prompts for category detection
+                category_texts = [f"a {category} jewelry" for category in jewelry_categories]
+                
+                # Process both image and text through CLIP
+                inputs = query_image.processor(
+                    text=category_texts, 
+                    images=image, 
+                    return_tensors="pt", 
+                    padding=True
+                )
                 inputs = {k: v.to(query_image.device) for k, v in inputs.items()}
                 
-                # Get image features using CLIP
+                # Get similarity scores between image and category texts
                 with torch.no_grad():
-                    image_features = query_image.model.get_image_features(**inputs)
+                    outputs = query_image.model(**inputs)
+                    logits_per_image = outputs.logits_per_image
+                    probs = logits_per_image.softmax(dim=1)
+                
+                # Find the most likely category
+                best_category_idx = probs.argmax().item()
+                best_category = jewelry_categories[best_category_idx]
+                confidence = probs[0][best_category_idx].item()
+                
+                logger.info(f"Detected category: {best_category} with confidence: {confidence:.3f}")
+                
+                # STEP 2: Get image embedding for visual similarity
+                image_inputs = query_image.processor(images=image, return_tensors="pt", padding=True)
+                image_inputs = {k: v.to(query_image.device) for k, v in image_inputs.items()}
+                
+                with torch.no_grad():
+                    image_features = query_image.model.get_image_features(**image_inputs)
                 
                 # Convert to numpy array and ensure correct shape
                 query_embedding = image_features.cpu().numpy().astype('float32')
@@ -761,7 +871,7 @@ def query_image(session_id):
                         query_embedding = query_embedding[:512]
                     else:
                         padding = np.zeros(512 - len(query_embedding), dtype='float32')
-                        query_embedding = np.concatenate([query_embedding, padding])
+                        query_embedding = np.concaten([query_embedding, padding])
                 
                 # Normalize the embedding
                 norm = np.linalg.norm(query_embedding)
@@ -770,42 +880,174 @@ def query_image(session_id):
                 else:
                     query_embedding = query_embedding.tolist()
                 
-                # Search for visually similar products using the image vector
-                logger.info(f"Searching for similar images with vector of length {len(query_embedding)}")
+                # STEP 3: Search for visually similar products (using existing VectorStore search method)
+                logger.info(f"Searching for similar images with detected category: {best_category}")
                 
-                # First try with image vector
+                # Use the existing search method without filter_categories parameter
                 search_results = vector_store.search(
                     collection_name=collection_name,
                     query_vector=query_embedding,
-                    vector_name="image",  # Use the image vector for search
-                    top_k=10,  # Get top 10 most similar items
-                    score_threshold=0.2  # Slightly higher threshold for better quality
+                    vector_name="image",
+                    top_k=20,  # Get more results for better filtering
+                    score_threshold=0.2  # Lower threshold for initial search
                 )
                 
-                # If no results, try with text vector as fallback
-                if not search_results:
-                    logger.info("No results with image vector, trying with text vector")
-                    search_results = vector_store.search(
-                        collection_name=collection_name,
-                        query_vector=query_embedding,
-                        vector_name="text",
-                        top_k=5,
-                        score_threshold=0.2
-                    )
-                
-                # Ensure search_results is a list (empty if None)
-                search_results = search_results or []
-                logger.info(f"Found {len(search_results)} potential matches")
-                
-                # Log first few results for debugging
-                for i, result in enumerate(search_results[:3], 1):
-                    logger.info(f"Match {i}: Score={result.get('score', 0):.3f}, ID={result.get('id', 'N/A')}, Name={result.get('payload', {}).get('name', 'Unnamed')}")
+                # Log the search results for debugging
+                if search_results:
+                    logger.info(f"Found {len(search_results)} potential matches")
+                else:
+                    logger.warning("No visually similar products found")
                 
                 if not search_results:
                     return jsonify({
                         "message": "No visually similar products found. Try adjusting your search criteria.", 
                         "results": []
                     })
+                
+                # STEP 4: Post-process results with STRICT category filtering
+                formatted_results = []
+                category_matches = []
+                seen_products = set()  # Track seen products for deduplication
+
+                # Define related categories for more flexible matching
+                related_categories = {
+                    'necklace': ['necklace', 'pendant', 'chain'],
+                    'pendant': ['pendant', 'necklace', 'chain'], 
+                    'ring': ['ring', 'band'],
+                    'bracelet': ['bracelet', 'bangle'],
+                    'earring': ['earring', 'stud'],
+                    'anklet': ['anklet'],
+                    'watch': ['watch'],
+                    'brooch': ['brooch'],
+                    'choker': ['choker', 'necklace']
+                }
+
+                # Get related categories for the detected category
+                target_categories = related_categories.get(best_category.lower(), [best_category.lower()])
+                logger.info(f"Looking for products in categories: {target_categories}")
+
+                for result in search_results:
+                    try:
+                        if hasattr(result, 'score'):
+                            # Qdrant ScoredPoint object
+                            payload = getattr(result, 'payload', {}) or {}
+                            base_score = float(getattr(result, 'score', 0))
+                            result_id = str(getattr(result, 'id', ''))
+                        else:
+                            # Dictionary format
+                            payload = result.get('payload', {})
+                            base_score = float(result.get('score', 0))
+                            result_id = str(result.get('id', ''))
+                        
+                        if not payload:
+                            continue
+                        
+                        # Create unique identifier for deduplication
+                        product_key = f"{payload.get('name', '')}_{payload.get('product_id', '')}"
+                        if product_key in seen_products:
+                            continue
+                        seen_products.add(product_key)
+                        
+                        # Get product details for category matching
+                        product_category = str(payload.get('category', '')).lower().strip()
+                        product_name = str(payload.get('name', '')).lower().strip()
+                        product_desc = str(payload.get('description', '')).lower().strip()
+                        
+                        # STRICT category matching - only include if it matches target categories
+                        is_category_match = False
+                        
+                        # Check if any target category appears in the product details
+                        for target_cat in target_categories:
+                            if (target_cat in product_category or 
+                                target_cat in product_name or 
+                                target_cat in product_desc or
+                                # Check for plural forms
+                                target_cat + 's' in product_category or
+                                target_cat + 's' in product_name):
+                                is_category_match = True
+                                break
+                        
+                        # If confidence is high, ONLY include category matches
+                        if confidence > 0.6 and not is_category_match:
+                            continue
+                        
+                        # If confidence is medium, be more selective
+                        elif confidence > 0.4 and not is_category_match and base_score < 0.7:
+                            continue
+                            
+                        # If confidence is low, include high-scoring visual matches
+                        elif confidence <= 0.4 and not is_category_match and base_score < 0.8:
+                            continue
+                        
+                        # Calculate final score with category boost
+                        final_score = base_score
+                        if is_category_match:
+                            final_score *= (1.5 + confidence)  # Higher boost for higher confidence
+                        
+                        # Convert score to percentage format
+                        percentage_score = min(100.0, max(0.0, final_score * 100))
+                        
+                        formatted_result = {
+                            'id': str(payload.get('product_id', result_id)),
+                            'name': str(payload.get('name', 'Unnamed Product')),
+                            'description': str(payload.get('description', '')),
+                            'price': str(payload.get('price', 'N/A')),
+                            'category': str(payload.get('category', 'Uncategorized')),
+                            'image_url': str(payload.get('image_url', '')),
+                            'score': round(percentage_score, 2),
+                            'is_category_match': is_category_match
+                        }
+                        
+                        category_matches.append(formatted_result)
+                        
+                        # Stop once we have enough good matches
+                        if len(category_matches) >= 8:
+                            break
+                            
+                    except Exception as e:
+                        logger.error(f"Error formatting result: {str(e)}", exc_info=True)
+                        continue
+
+                # Sort by score
+                category_matches.sort(key=lambda x: x.get('score', 0), reverse=True)
+
+                # Take top 5 results
+                formatted_results = category_matches[:5]
+
+                if not formatted_results:
+                    logger.warning("No valid products found after strict filtering")
+                    return jsonify({
+                        "message": f"No {best_category} products found in your catalog. Try with a different image or check if you have {best_category} products uploaded.",
+                        "detected_category": best_category,
+                        "confidence": round(confidence * 100, 1),
+                        "results": []
+                    })
+
+                # Create response message
+                category_count = len([r for r in formatted_results if r.get('is_category_match')])
+                total_count = len(formatted_results)
+
+                if confidence > 0.6:
+                    if category_count == total_count:
+                        message = f"Found {total_count} {best_category}(s) matching your image"
+                    else:
+                        message = f"Found {category_count} {best_category}(s) and {total_count - category_count} similar items"
+                elif confidence > 0.4:
+                    message = f"Found {total_count} products similar to your {best_category} image"
+                else:
+                    message = f"Found {total_count} visually similar products"
+
+                # Remove the is_category_match flag from final results (internal use only)
+                for result in formatted_results:
+                    result.pop('is_category_match', None)
+
+                logger.info(f"Returning {len(formatted_results)} strictly filtered results with {category_count} category matches")
+                return jsonify({
+                    "message": message,
+                    "detected_category": best_category,
+                    "confidence": round(confidence * 100, 1),
+                    "results": formatted_results
+                })
                     
             except Exception as e:
                 logger.error(f"Error processing image with CLIP: {str(e)}", exc_info=True)
@@ -814,70 +1056,6 @@ def query_image(session_id):
                     "details": str(e),
                     "results": []
                 }), 500
-            
-            # Process and format search results
-            filtered_results = []
-            seen_products = set()  # Track seen products for deduplication
-            
-            for result in search_results:
-                try:
-                    payload = result.get('payload', {})
-                    if not payload or not isinstance(payload, dict):
-                        logger.warning(f"Skipping result with invalid payload: {result}")
-                        continue
-                        
-                    # Ensure required fields exist
-                    if 'image_url' not in payload or not payload['image_url']:
-                        logger.warning(f"Skipping result without image URL: {payload.get('product_id', 'unknown')}")
-                        continue
-                        
-                    # Create unique identifier for deduplication
-                    product_key = f"{payload.get('name', '')}_{payload.get('description', '')}"
-                    if product_key in seen_products:
-                        continue
-                    seen_products.add(product_key)
-                        
-                    base_score = float(result.get('score', 0.0))
-                    
-                    # Convert score to percentage format
-                    percentage_score = min(100.0, max(0.0, base_score * 100))
-                    
-                    # Format the result with visual similarity score
-                    formatted_result = {
-                        'id': payload.get('product_id', result.get('id', str(uuid.uuid4()))),
-                        'name': str(payload.get('name', 'Unnamed Product')),
-                        'description': str(payload.get('description', '')),
-                        'price': str(payload.get('price', '')),
-                        'category': str(payload.get('category', '')),
-                        'image_url': str(payload.get('image_url', '')),
-                        'score': percentage_score  # Using percentage-formatted similarity score
-                    }
-                    
-                    filtered_results.append(formatted_result)
-                    
-                    # Limit to top 5 results
-                    if len(filtered_results) >= 5:
-                        break
-                        
-                except Exception as e:
-                    logger.error(f"Error formatting search result: {str(e)}", exc_info=True)
-                    continue
-            
-            # Sort by score (highest first)
-            filtered_results.sort(key=lambda x: x.get('score', 0), reverse=True)
-            
-            if not filtered_results:
-                logger.warning("No valid products found after filtering")
-                return jsonify({
-                    "message": "No visually similar products found. Try with a different image.",
-                    "results": []
-                })
-                
-            logger.info(f"Returning {len(filtered_results)} filtered results")
-            return jsonify({
-                "message": f"Found {len(filtered_results)} visually similar products",
-                "results": filtered_results
-            })
             
         except ValueError as ve:
             logger.error(f"Validation error in query_image: {str(ve)}")

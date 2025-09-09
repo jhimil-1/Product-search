@@ -271,13 +271,16 @@ class VectorStore:
     def search(
         self, 
         collection_name: str, 
-        query_vector: List[float], 
+        query_vector: List[float] = None, 
+        vector_name: str = None,
+        filter_conditions: Dict = None, 
+        query_text: str = None, 
+        exact_match: bool = False,
         top_k: int = 5, 
-        score_threshold: float = 0.0, 
-        vector_name: str = "text"
+        score_threshold: float = 0.3
     ) -> List[Dict[str, Any]]:
         """
-        Search for similar vectors in the specified collection.
+        Search for similar vectors in the specified collection with optional category filtering.
         
         Args:
             collection_name: Name of the collection to search in
@@ -285,6 +288,9 @@ class VectorStore:
             top_k: Number of results to return
             score_threshold: Minimum similarity score (0.0 to 1.0)
             vector_name: Name of the vector to search in ("text" or "image")
+            filter_categories: List of categories to filter by
+            query_text: Text query for exact matching
+            exact_match: If True, perform exact text matching instead of vector search
             
         Returns:
             List of search results with payload and score
@@ -296,14 +302,80 @@ class VectorStore:
                 
             logger.info(f"Searching collection '{collection_name}' with {vector_name} vector of length {len(query_vector)}")
             
-            search_results = self.client.search(
-                collection_name=collection_name,
-                query_vector=(vector_name, query_vector),
-                limit=top_k,
-                score_threshold=score_threshold,
-                with_vectors=False,
-                with_payload=True
-            )
+            # Build filter conditions if provided
+            filter_condition = None
+            if filter_conditions and isinstance(filter_conditions, dict):
+                logger.info(f"Applying filter conditions: {filter_conditions}")
+                conditions = []
+                
+                # Handle category filtering
+                if 'category' in filter_conditions:
+                    category = filter_conditions['category']
+                    conditions.append(
+                        models.FieldCondition(
+                            key="category",
+                            match=models.MatchText(text=category)
+                        )
+                    )
+                
+                # Add more filter conditions as needed
+                # Example for price range:
+                # if 'min_price' in filter_conditions:
+                #     conditions.append(...)
+                
+                if conditions:
+                    filter_condition = models.Filter(
+                        must=conditions
+                    )
+            
+            try:
+                # If exact match is requested, use full-text search
+                if exact_match and query_text:
+                    logger.info(f"Performing exact match search for: {query_text}")
+                    search_results = self.client.query(
+                        collection_name=collection_name,
+                        query_text=query_text,
+                        query_filter=filter_condition,
+                        limit=top_k,
+                        with_vectors=False,
+                        with_payload=True
+                    )
+                else:
+                    # Perform vector search with optional filters
+                    search_results = self.client.search(
+                        collection_name=collection_name,
+                        query_vector=(vector_name, query_vector) if vector_name else query_vector,
+                        query_filter=filter_condition,
+                        limit=top_k * 2,  # Get more results to ensure we have enough after filtering
+                        score_threshold=score_threshold,
+                        with_vectors=False,
+                        with_payload=True
+                    )
+                
+                # Additional client-side filtering for categories
+                if filter_condition and search_results:
+                    filtered_results = []
+                    for hit in search_results:
+                        try:
+                            payload = getattr(hit, 'payload', {}) or {}
+                            hit_category = str(payload.get('category', '')).lower()
+                            # Check if any of the matched categories are in the result's category
+                            if any(cat.lower() in hit_category for cat in filter_categories):
+                                filtered_results.append(hit)
+                                if len(filtered_results) >= top_k:
+                                    break
+                        except Exception as e:
+                            logger.warning(f"Error processing search result: {str(e)}")
+                            continue
+                    
+                    if filtered_results:
+                        return filtered_results
+                
+                return search_results
+                
+            except Exception as e:
+                logger.error(f"Error in search: {str(e)}")
+                return []
             
             if not search_results:
                 logger.info("No search results found")
