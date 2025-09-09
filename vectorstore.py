@@ -50,6 +50,41 @@ class VectorStore:
             logger.error(error_msg)
             raise
 
+    def create_collection(self, collection_name: str, vector_size: int = 512, recreate: bool = False) -> None:
+        """
+        Create a new collection with the given name and vector size.
+        
+        Args:
+            collection_name: Name of the collection to create
+            vector_size: Dimensionality of the vectors (default: 512 for CLIP model)
+            recreate: If True, delete existing collection with the same name
+        """
+        try:
+            # Delete existing collection if recreate is True
+            if recreate:
+                self.delete_collection(collection_name)
+            
+            # Create new collection with both text and image vectors
+            self.client.recreate_collection(
+                collection_name=collection_name,
+                vectors_config={
+                    "text": models.VectorParams(
+                        size=vector_size,  # CLIP uses 512-dimensional vectors
+                        distance=models.Distance.COSINE
+                    ),
+                    "image": models.VectorParams(
+                        size=vector_size,  # Same size as text for CLIP
+                        distance=models.Distance.COSINE
+                    )
+                }
+            )
+            logger.info(f"Created new collection: {collection_name} with text and image vectors of size {vector_size}")
+            
+        except Exception as e:
+            error_msg = f"Failed to create collection {collection_name}"
+            logger.error(f"{error_msg}: {str(e)}")
+            raise Exception(f"{error_msg}: {str(e)}")
+
     def create_collection_if_not_exists(self, name: str, vector_size: int = 512) -> bool:
         """Create collection if it doesn't exist
         
@@ -60,15 +95,7 @@ class VectorStore:
         try:
             collections = [c.name for c in self.client.get_collections().collections]
             if name not in collections:
-                self.client.recreate_collection(
-                    collection_name=name,
-                    vectors_config={
-                        "image": models.VectorParams(
-                            size=vector_size,  # Now using 512 to match CLIP
-                            distance=models.Distance.COSINE
-                        )
-                    }
-                )
+                self.create_collection(name, vector_size)
                 logger.info(f"Created new collection: {name} with vector size {vector_size}")
             return True
         except Exception as e:
@@ -90,69 +117,78 @@ class VectorStore:
         Returns:
             bool: True if successful, False otherwise
         """
-        if not points:
-            logger.warning("No points to upsert")
-            return False
-            
         try:
-            self.create_collection_if_not_exists(collection_name)
+            point_objects = []
             
-            # Process points in batches to avoid timeouts
-            batch_size = 50
-            total_points = len(points)
-            
-            for i in range(0, total_points, batch_size):
-                batch = points[i:i + batch_size]
-                point_objects = []
-                
-                for point in batch:
-                    try:
-                        point_id = point.get("id") or str(uuid.uuid4())
-                        vector = point.get("vector")
-                        payload = point.get("payload", {})
-                        
-                        if not vector:
-                            logger.warning(f"Skipping point {point_id}: No vector provided")
-                            continue
-                            
-                        # Ensure payload is a dictionary
-                        if not isinstance(payload, dict):
-                            payload = {"value": payload}
-                            
-                        # Convert datetime objects to ISO format strings
-                        for key, value in payload.items():
-                            if hasattr(value, 'isoformat') and callable(value.isoformat):
-                                payload[key] = value.isoformat()
-                            elif isinstance(value, (bytes, bytearray)):
-                                payload[key] = str(value)
-                        
-                        point_objects.append(models.PointStruct(
-                            id=point_id,
-                            vector={"image": vector},  # Use named vector
-                            payload=payload
-                        ))
-                        
-                    except Exception as e:
-                        logger.error(f"Error creating point: {str(e)}", exc_info=True)
+            for point in points:
+                try:
+                    point_id = point.get("id")
+                    vector = point.get("vector")
+                    payload = point.get("payload", {})
+                    
+                    if not all([point_id, vector]):
+                        logger.warning(f"Skipping invalid point: {point}")
                         continue
-                
-                if point_objects:
-                    logger.info(f"Upserting batch of {len(point_objects)} points to {collection_name}")
-                    try:
-                        self.client.upsert(
-                            collection_name=collection_name,
-                            points=point_objects,
-                            wait=True
-                        )
-                        logger.info(f"Successfully upserted {len(point_objects)} points")
-                    except Exception as e:
-                        logger.error(f"Error upserting batch: {str(e)}", exc_info=True)
-                        return False
+                    
+                    # Handle different vector formats
+                    if isinstance(vector, dict):
+                        # If vector is already a dict with a named vector, use it as is
+                        vector_dict = vector
+                    else:
+                        # Otherwise, wrap the vector in a dict with a default name
+                        vector_dict = {"text": vector}
+                    
+                    # Convert point_id to string if it's a number
+                    point_id = str(point_id)
+                    
+                    point_objects.append(models.PointStruct(
+                        id=point_id,
+                        vector=vector_dict,
+                        payload=payload
+                    ))
+                except Exception as e:
+                    logger.error(f"Error processing point {point.get('id')}: {str(e)}")
+                    continue
             
+            if not point_objects:
+                logger.error("No valid points to upsert")
+                return False
+                
+            # Upsert points
+            self.client.upsert(
+                collection_name=collection_name,
+                points=point_objects,
+                wait=True
+            )
+            
+            logger.info(f"Successfully upserted {len(point_objects)} points to collection '{collection_name}'")
             return True
             
         except Exception as e:
-            logger.error(f"Error in upsert_points: {str(e)}", exc_info=True)
+            logger.error(f"Error in upsert_points: {str(e)}")
+            logger.exception("Upsert points error details:")
+            return False
+
+    def delete_collection(self, collection_name: str) -> bool:
+        """
+        Delete a collection by name.
+        
+        Args:
+            collection_name: Name of the collection to delete
+            
+        Returns:
+            bool: True if deletion was successful or collection didn't exist, False otherwise
+        """
+        try:
+            self.client.delete_collection(collection_name=collection_name)
+            logger.info(f"Successfully deleted collection: {collection_name}")
+            return True
+        except Exception as e:
+            # If collection doesn't exist, consider it a success
+            if "not found" in str(e).lower():
+                logger.info(f"Collection {collection_name} not found, nothing to delete")
+                return True
+            logger.error(f"Failed to delete collection {collection_name}: {str(e)}")
             return False
 
     def query_similar(
@@ -181,10 +217,10 @@ class VectorStore:
                 
             logger.info(f"Querying {collection_name} with vector of length {len(vector)}")
             
-            # Search with named vector "image"
+            # Search with named vector "text"
             search_result = self.client.search(
                 collection_name=collection_name,
-                query_vector=("image", vector),  # Use named vector
+                query_vector=("text", vector),  # Specify vector name as "text"
                 limit=top_k,
                 score_threshold=score_threshold,
                 with_vectors=False,
@@ -230,6 +266,78 @@ class VectorStore:
             
         except Exception as e:
             logger.error(f"Error in query_similar: {str(e)}", exc_info=True)
+            return []
+
+    def search(
+        self, 
+        collection_name: str, 
+        query_vector: List[float], 
+        top_k: int = 5, 
+        score_threshold: float = 0.0, 
+        vector_name: str = "text"
+    ) -> List[Dict[str, Any]]:
+        """
+        Search for similar vectors in the specified collection.
+        
+        Args:
+            collection_name: Name of the collection to search in
+            query_vector: Query vector for similarity search
+            top_k: Number of results to return
+            score_threshold: Minimum similarity score (0.0 to 1.0)
+            vector_name: Name of the vector to search in ("text" or "image")
+            
+        Returns:
+            List of search results with payload and score
+        """
+        try:
+            if not query_vector:
+                logger.error("Empty query vector provided")
+                return []
+                
+            logger.info(f"Searching collection '{collection_name}' with {vector_name} vector of length {len(query_vector)}")
+            
+            search_results = self.client.search(
+                collection_name=collection_name,
+                query_vector=(vector_name, query_vector),
+                limit=top_k,
+                score_threshold=score_threshold,
+                with_vectors=False,
+                with_payload=True
+            )
+            
+            if not search_results:
+                logger.info("No search results found")
+                return []
+                
+            # Process and format search results
+            results = []
+            for hit in search_results:
+                try:
+                    # Handle different payload formats
+                    payload = dict(hit.payload or {})
+                    
+                    # Ensure all values in payload are JSON serializable
+                    for key, value in payload.items():
+                        if hasattr(value, 'isoformat'):  # Handle datetime
+                            payload[key] = value.isoformat()
+                        elif isinstance(value, (bytes, bytearray)):  # Handle binary data
+                            payload[key] = str(value)
+                    
+                    results.append({
+                        "id": str(hit.id) if hasattr(hit, 'id') else str(uuid.uuid4()),
+                        "score": float(hit.score) if hasattr(hit, 'score') else 0.0,
+                        "payload": payload
+                    })
+                    
+                except Exception as e:
+                    logger.error(f"Error processing search hit: {str(e)}", exc_info=True)
+                    continue
+            
+            logger.info(f"Found {len(results)} search results")
+            return results
+            
+        except Exception as e:
+            logger.error(f"Error in search: {str(e)}", exc_info=True)
             return []
 
 # Note: We don't initialize the vectorstore here anymore

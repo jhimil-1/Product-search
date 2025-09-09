@@ -374,68 +374,10 @@
       }
       
       try {
-        // Validate JSON syntax before submission
-        let products;
-        try {
-          products = JSON.parse(productsJson);
-        } catch (jsonError) {
-          // Provide detailed JSON error message
-          const errorMessage = jsonError.message || "Invalid JSON format";
-          const positionMatch = errorMessage.match(/position (\d+)/);
-          let detailedError = `JSON Error: ${errorMessage}`;
-          
-          if (positionMatch) {
-            const position = parseInt(positionMatch[1]);
-            const lines = productsJson.substring(0, position).split('\n');
-            const lineNumber = lines.length;
-            const columnNumber = lines[lines.length - 1].length + 1;
-            detailedError += ` at line ${lineNumber}, column ${columnNumber}`;
-          }
-          
-          statusDiv.textContent = detailedError;
-          statusDiv.style.color = "#f44336";
-          return;
-        }
-        
+        // Parse JSON to validate
+        const products = JSON.parse(productsJson);
         if (!Array.isArray(products)) {
-          statusDiv.textContent = "Products must be an array of product objects";
-          statusDiv.style.color = "#f44336";
-          return;
-        }
-        
-        if (products.length === 0) {
-          statusDiv.textContent = "Please provide at least one product";
-          statusDiv.style.color = "#f44336";
-          return;
-        }
-        
-        // Validate each product structure
-        for (let i = 0; i < products.length; i++) {
-          const product = products[i];
-          if (typeof product !== 'object' || product === null) {
-            statusDiv.textContent = `Product at index ${i} must be an object`;
-            statusDiv.style.color = "#f44336";
-            return;
-          }
-          
-          if (!product.name) {
-            statusDiv.textContent = `Product at index ${i} is missing required 'name' field`;
-            statusDiv.style.color = "#f44336";
-            return;
-          }
-          
-          if (!product.product_id) {
-            statusDiv.textContent = `Product at index ${i} is missing required 'product_id' field`;
-            statusDiv.style.color = "#f44336";
-            return;
-          }
-        }
-        
-        // Check image count matches product count
-        if (imageFiles.length > 0 && imageFiles.length !== products.length) {
-          statusDiv.textContent = `Number of images (${imageFiles.length}) must match number of products (${products.length})`;
-          statusDiv.style.color = "#f44336";
-          return;
+          throw new Error("Products must be an array");
         }
         
         // Add image_filename to each product if not present
@@ -464,7 +406,7 @@
         // Send request
         const response = await fetch(`/upload_products/${sessionId}`, {
           method: "POST",
-          body: formData
+          body: formData  // Let the browser set Content-Type with boundary
         });
         
         if (!response.ok) {
@@ -519,75 +461,12 @@
         return;
       }
       
-      // Priority: If both text and image are provided, use image search only
-      if (file) {
-        addMessage("user", query ? `${query} [Image: ${file.name}]` : `[Image: ${file.name}]`);
-        
-        const formData = new FormData();
-        formData.append("file", file);
-        
-        try {
-          const response = await fetch(`/query_image/${sessionId}`, {
-            method: "POST",
-            body: formData
-          });
-          
-          let data;
-          try {
-            data = await response.json();
-          } catch (parseError) {
-            throw new Error("Server returned invalid response format. Please check your connection.");
-          }
-          
-          if (response.ok) {
-            // Display the message from the server
-            if (data.message) {
-              addMessage("bot", data.message);
-            }
-            
-            // Display results if available
-            if (data.results && Array.isArray(data.results) && data.results.length > 0) {
-              data.results.forEach(product => {
-                const scoreText = product.score ? `${Math.round(product.score)}` : '';
-                addMessage("bot", {
-                  name: product.name || 'Unnamed Product',
-                  price: product.price || '',
-                  category: product.category || '',
-                  description: product.description || '',
-                  image_url: product.image_url || '',
-                  score: scoreText
-                }, true);
-              });
-            } else if (!data.message) {
-              addMessage("bot", "No similar products found.");
-            }
-          } else {
-            addMessage(`Error: ${data.error || 'Failed to process image'}`, 'error');
-          }
-        } catch (error) {
-          console.error('Error searching by image:', error);
-          if (error.message && error.message.includes("Unexpected token")) {
-            addMessage("bot", "Error: Server returned invalid response. Please check your connection and try again.");
-          } else {
-            addMessage('An error occurred while searching for similar products. Please try again.', 'error');
-          }
-        }
-        
-        // Clear the file input
-        fileInput.value = "";
-        document.getElementById("selectedImage").textContent = "No image selected";
-        
-        // Clear text query if it was used with image
-        if (query) {
-          document.getElementById("textQuery").value = "";
-        }
-      } else if (query) {
-        // Text-only search
+      if (query) {
         addMessage("user", query);
         document.getElementById("textQuery").value = "";
         
         try {
-          const response = await fetch(`/query`, {
+          const response = await fetch("/query_text", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ 
@@ -596,12 +475,7 @@
             })
           });
           
-          let data;
-          try {
-            data = await response.json();
-          } catch (parseError) {
-            throw new Error("Server returned invalid response format. Please check your connection.");
-          }
+          const data = await response.json();
           
           if (response.ok) {
             // Display the message from the server
@@ -612,14 +486,13 @@
             // Display results if available
             if (data.results && Array.isArray(data.results) && data.results.length > 0) {
               data.results.forEach(product => {
-                const scoreText = product.score ? `${Math.round(product.score)}` : '';
                 addMessage("bot", {
                   name: product.name || 'Unnamed Product',
                   price: product.price || '',
                   category: product.category || '',
                   description: product.description || '',
                   image_url: product.image_url || '',
-                  score: scoreText
+                  score: product.score ? Math.round(product.score * 100) + '%' : ''
                 }, true);
               });
             } else if (!data.message) {
@@ -630,12 +503,56 @@
           }
         } catch (error) {
           console.error("Error processing query:", error);
-          if (error.message && error.message.includes("Unexpected token")) {
-            addMessage("bot", "Error: Server returned invalid response. Please check your connection and try again.");
-          } else {
-            addMessage("bot", "Error: " + (error.message || "Failed to process your query"));
-          }
+          addMessage("bot", "Error: " + (error.message || "Failed to process your query"));
         }
+      }
+      
+      if (file) {
+        addMessage("user", "[Image: " + file.name + "]");
+        
+        const formData = new FormData();
+        formData.append("file", file);
+        
+        try {
+          const response = await fetch(`/query_image/${sessionId}`, {
+            method: "POST",
+            body: formData
+          });
+          
+          const data = await response.json();
+          
+          if (response.ok) {
+            // Display the answer from the server
+            if (data.answer) {
+              addMessage("bot", data.answer);
+            }
+            
+            // Display images if available
+            if (data.images && Array.isArray(data.images) && data.images.length > 0) {
+              data.images.forEach(product => {
+                addMessage("bot", {
+                  name: product.description || 'Unnamed Product',
+                  price: product.price || '',
+                  category: product.category || '',
+                  description: product.description || '',
+                  image_url: product.url || '',
+                  score: product.score ? product.score + '%' : ''
+                }, true);
+              });
+            } else if (!data.answer) {
+              addMessage("bot", "No similar products found.");
+            }
+          } else {
+            addMessage(`Error: ${data.error || 'Failed to process image'}`, 'error');
+          }
+        } catch (error) {
+          console.error('Error searching by image:', error);
+          addMessage('An error occurred while searching for similar products. Please try again.', 'error');
+        }
+        
+        // Clear the file input
+        fileInput.value = "";
+        document.getElementById("selectedImage").textContent = "No image selected";
       }
     };
 

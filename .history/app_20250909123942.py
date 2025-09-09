@@ -540,49 +540,95 @@ def query_text():
         return jsonify({"error": "An error occurred while processing your request"}), 500
 
 def handle_product_search(query: str, session_id: str, collection_name: str):
-    """Handle product search by text query with exact matching when possible"""
+    """Handle product search by text query with strict type matching"""
     try:
         # Verify session exists
         session_data = sessions_col.find_one({"_id": session_id})
         if not session_data or 'collection_name' not in session_data:
             return jsonify({"error": "Session not found"}), 404
         
-        # First, try to find an exact match by product name
-        exact_matches = vector_store.search(
-            collection_name=collection_name,
-            query_text=query,
-            exact_match=True,
-            top_k=1
-        )
+        # Define product types and check if query contains any
+        product_types = ["ring", "necklace", "bracelet", "earring", "watch"]
+        query_lower = query.lower()
         
-        # If we found an exact match, return only that product
-        if exact_matches and hasattr(exact_matches[0], 'score') and exact_matches[0].score > 0.9:
-            return format_product_results([exact_matches[0]])
+        # Find exact product type matches in the query
+        matched_types = []
+        for ptype in product_types:
+            # Use word boundaries to match whole words only
+            if re.search(r'\b' + re.escape(ptype) + r'\b', query_lower):
+                matched_types.append(ptype)
+        
+        # If we have matched types, modify the query to emphasize the type
+        if matched_types:
+            # Create a query that boosts the product type
+            boosted_query = f"{' '.join([f'{t} ' * 5 for t in matched_types])} {query}"
+            query_embedding = embed_text(boosted_query)
+        else:
+            query_embedding = embed_text(query)
             
-        # If no exact match, proceed with semantic search
-        query_embedding = embed_text(query)
         if not query_embedding:
             return jsonify({"error": "Failed to process search query"}), 500
-            
-        # Get semantic search results
+        
+        # Get more results to ensure we have enough for filtering
         results = vector_store.search(
             collection_name=collection_name,
             query_vector=query_embedding,
-            top_k=5,
-            score_threshold=0.5  # Higher threshold for more relevant results
+            top_k=50,  # Get more results for better filtering
+            score_threshold=0.1  # Lower threshold to ensure we get enough results
         )
         
-        # If we have results, filter for high confidence matches
-        if results:
-            # Only keep results with high confidence (score > 0.8)
-            filtered_results = [r for r in results if hasattr(r, 'score') and r.score > 0.8]
-            
-            # If we have high confidence results, return them
-            if filtered_results:
-                return format_product_results(filtered_results[:1])  # Return only top result
+        # If we found specific product types in the query, filter strictly
+        if matched_types:
+            filtered_results = []
+            for result in results:
+                payload = result.payload if hasattr(result, 'payload') else {}
+                name = str(payload.get('name', '')).lower()
+                description = str(payload.get('description', '')).lower()
+                category = str(payload.get('category', '')).lower()
                 
-        # If we get here, return the original results (if any) or an empty list
-        return format_product_results(results[:1])  # Return only top result
+                # Combine all text fields for searching
+                product_text = f"{name} {description} {category}"
+                
+                # Check if the product matches ANY of the mentioned types
+                # using word boundaries to ensure exact matches
+                type_matches = []
+                for ptype in matched_types:
+                    # Check if the product type appears as a whole word in any field
+                    if (re.search(r'\b' + re.escape(ptype) + r'\b', name) or
+                        re.search(r'\b' + re.escape(ptype) + r'\b', description) or
+                        re.search(r'\b' + re.escape(ptype) + r'\b', category)):
+                        type_matches.append(True)
+                    else:
+                        type_matches.append(False)
+                
+                # Only include if it matches at least one of the required types
+                if any(type_matches):
+                    # Calculate a score boost based on how many type matches we have
+                    type_boost = 1.0 + (0.5 * sum(type_matches))
+                    if hasattr(result, 'score'):
+                        result.score = result.score * type_boost
+                    filtered_results.append(result)
+                    
+                    if len(filtered_results) >= 10:  # Get more than we need for final filtering
+                        break
+            
+            # If we found matching types, use those results
+            if filtered_results:
+                # Sort by score (highest first)
+                filtered_results.sort(key=lambda x: x.score, reverse=True)
+                results = filtered_results
+        
+        # If no results after filtering, try a more lenient search
+        if not results:
+            results = vector_store.search(
+                collection_name=collection_name,
+                query_vector=query_embedding,
+                top_k=5,
+                score_threshold=0.2
+            )
+        
+        # Ensure we don't return more than 5 results
+        return format_product_results(results[:5])
         
     except Exception as e:
         logger.error(f"Error in handle_product_search: {str(e)}", exc_info=True)
@@ -641,8 +687,6 @@ def format_product_results(results):
         return []
         
     formatted_results = []
-    seen_products = set()  # Track seen products for deduplication
-    
     for result in results:
         try:
             # Handle both Qdrant result object and dictionary
@@ -657,15 +701,6 @@ def format_product_results(results):
                 score = float(result.get('score', 0.0))
                 result_id = str(result.get('id', ''))
             
-            # Create unique identifier for deduplication
-            product_key = f"{payload.get('name', '')}_{payload.get('description', '')}"
-            if product_key in seen_products:
-                continue
-            seen_products.add(product_key)
-            
-            # Convert score to percentage format
-            percentage_score = min(100.0, max(0.0, score * 100))
-            
             # Extract product details with proper defaults
             product = {
                 'id': payload.get('product_id', result_id),
@@ -674,7 +709,7 @@ def format_product_results(results):
                 'price': str(payload.get('price', '')),
                 'category': str(payload.get('category', '')),
                 'image_url': str(payload.get('image_url', '')),
-                'score': percentage_score
+                'score': score
             }
             
             # Ensure image path is in the correct format
@@ -746,29 +781,10 @@ def query_image(session_id):
                 with torch.no_grad():
                     image_features = query_image.model.get_image_features(**inputs)
                 
-                # Convert to numpy array and ensure correct shape
-                query_embedding = image_features.cpu().numpy().astype('float32')
-                
-                # Ensure we have a 1D array of the correct dimension
-                if len(query_embedding.shape) > 1:
-                    query_embedding = query_embedding.reshape(-1)
-                
-                # Check dimension
-                if len(query_embedding) != 512:  # CLIP embedding dimension
-                    logger.warning(f"Unexpected query embedding dimension: {len(query_embedding)}")
-                    # Truncate or pad if necessary
-                    if len(query_embedding) > 512:
-                        query_embedding = query_embedding[:512]
-                    else:
-                        padding = np.zeros(512 - len(query_embedding), dtype='float32')
-                        query_embedding = np.concatenate([query_embedding, padding])
-                
-                # Normalize the embedding
-                norm = np.linalg.norm(query_embedding)
-                if norm > 0:
-                    query_embedding = (query_embedding / norm).tolist()
-                else:
-                    query_embedding = query_embedding.tolist()
+                # Convert to numpy array and normalize
+                query_embedding = image_features.cpu().numpy()[0].astype('float32')
+                query_embedding = query_embedding / (np.linalg.norm(query_embedding, axis=-1, keepdims=True) + 1e-6)
+                query_embedding = query_embedding.tolist()
                 
                 # Search for visually similar products using the image vector
                 logger.info(f"Searching for similar images with vector of length {len(query_embedding)}")
@@ -817,8 +833,6 @@ def query_image(session_id):
             
             # Process and format search results
             filtered_results = []
-            seen_products = set()  # Track seen products for deduplication
-            
             for result in search_results:
                 try:
                     payload = result.get('payload', {})
@@ -831,16 +845,7 @@ def query_image(session_id):
                         logger.warning(f"Skipping result without image URL: {payload.get('product_id', 'unknown')}")
                         continue
                         
-                    # Create unique identifier for deduplication
-                    product_key = f"{payload.get('name', '')}_{payload.get('description', '')}"
-                    if product_key in seen_products:
-                        continue
-                    seen_products.add(product_key)
-                        
                     base_score = float(result.get('score', 0.0))
-                    
-                    # Convert score to percentage format
-                    percentage_score = min(100.0, max(0.0, base_score * 100))
                     
                     # Format the result with visual similarity score
                     formatted_result = {
@@ -850,7 +855,7 @@ def query_image(session_id):
                         'price': str(payload.get('price', '')),
                         'category': str(payload.get('category', '')),
                         'image_url': str(payload.get('image_url', '')),
-                        'score': percentage_score  # Using percentage-formatted similarity score
+                        'score': base_score  # Using the raw similarity score from CLIP
                     }
                     
                     filtered_results.append(formatted_result)
