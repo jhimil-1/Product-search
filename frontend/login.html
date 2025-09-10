@@ -4,6 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Login - AI E-commerce Assistant</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
     <style>
         body {
             font-family: Arial, sans-serif;
@@ -70,6 +71,40 @@
             text-align: center;
             display: none;
         }
+        .auth-links {
+            margin-top: 1.5rem;
+            text-align: center;
+        }
+        .auth-links a {
+            color: #4CAF50;
+            text-decoration: none;
+            font-size: 0.9rem;
+            display: block;
+            margin: 0.5rem 0;
+        }
+        .auth-links a:hover {
+            text-decoration: underline;
+        }
+        .divider {
+            display: flex;
+            align-items: center;
+            text-align: center;
+            margin: 1.5rem 0;
+            color: #777;
+            font-size: 0.9rem;
+        }
+        .divider::before,
+        .divider::after {
+            content: '';
+            flex: 1;
+            border-bottom: 1px solid #ddd;
+        }
+        .divider::before {
+            margin-right: 1rem;
+        }
+        .divider::after {
+            margin-left: 1rem;
+        }
     </style>
 </head>
 <body>
@@ -80,15 +115,21 @@
         </div>
         <form id="loginForm">
             <div class="form-group">
-                <label for="name">Your Name</label>
-                <input type="text" id="name" name="name" required>
+                <label for="username">Username</label>
+                <input type="text" id="username" name="username" required>
             </div>
             <div class="form-group">
-                <label for="email">Email Address</label>
-                <input type="email" id="email" name="email" required>
+                <label for="password">Password</label>
+                <input type="password" id="password" name="password" required>
             </div>
             <button type="submit" class="login-button">Login</button>
             <div id="errorMessage" class="error-message"></div>
+            
+            <div class="auth-links">
+                <a href="/forgot-password">Forgot your password?</a>
+                <div class="divider">or</div>
+                <p>Don't have an account? <a href="/signup">Sign up</a></p>
+            </div>
         </form>
     </div>
 
@@ -96,12 +137,12 @@
         document.getElementById('loginForm').addEventListener('submit', async (e) => {
             e.preventDefault();
             
-            const name = document.getElementById('name').value;
-            const email = document.getElementById('email').value;
+            const username = document.getElementById('username').value;
+            const password = document.getElementById('password').value;
             const errorElement = document.getElementById('errorMessage');
             const loginButton = document.querySelector('.login-button');
             
-            // Clear previous errors
+            // Clear previous errors and update UI
             errorElement.style.display = 'none';
             loginButton.disabled = true;
             loginButton.textContent = 'Logging in...';
@@ -109,28 +150,44 @@
             try {
                 const response = await fetch('/login', {
                     method: 'POST',
+                    credentials: 'include',  // Important for sending cookies with CORS
                     headers: {
                         'Content-Type': 'application/json',
+                        'Accept': 'application/json',
+                        'X-Requested-With': 'XMLHttpRequest'
                     },
-                    body: JSON.stringify({ name, email })
+                    body: JSON.stringify({
+                        username: username,
+                        password: password
+                    })
                 });
                 
                 const data = await response.json();
                 
                 if (!response.ok) {
-                    throw new Error(data.error || 'Login failed');
+                    // Handle different types of error responses
+                    const errorMsg = data.message || data.error || 'Login failed. Please try again.';
+                    throw new Error(errorMsg);
                 }
                 
-                // Store user data in sessionStorage
-                sessionStorage.setItem('user', JSON.stringify(data.user));
-                
-                // Redirect to the main page
-                window.location.href = data.redirect || '/';
+                // Handle successful login
+                if (data.redirect) {
+                    window.location.href = data.redirect;
+                } else if (data.authenticated) {
+                    window.location.href = '/';
+                } else {
+                    throw new Error('Login failed. Please try again.');
+                }
                 
             } catch (error) {
                 console.error('Login error:', error);
                 errorElement.textContent = error.message || 'An error occurred during login';
                 errorElement.style.display = 'block';
+                
+                // Ensure we're on the login page
+                if (window.location.pathname !== '/login' && window.location.pathname !== '/login.html') {
+                    window.location.href = '/login';
+                }
             } finally {
                 loginButton.disabled = false;
                 loginButton.textContent = 'Login';
@@ -139,22 +196,42 @@
         
         // Check if user is already logged in
         document.addEventListener('DOMContentLoaded', () => {
-            // If there's a user in sessionStorage, check with the server
-            const user = sessionStorage.getItem('user');
-            if (user) {
-                fetch('/check_session')
-                    .then(response => {
-                        if (response.ok) {
-                            window.location.href = '/';
-                        } else {
-                            sessionStorage.removeItem('user');
-                        }
-                    })
-                    .catch(() => {
-                        sessionStorage.removeItem('user');
-                    });
+            // Only check session if we're not already on the login page
+            if (window.location.pathname !== '/login' && window.location.pathname !== '/login.html') {
+                checkSession();
             }
         });
+
+        async function checkSession() {
+            try {
+                const response = await fetch('/check_session', {
+                    method: 'GET',
+                    credentials: 'include',
+                    headers: {
+                        'X-Requested-With': 'XMLHttpRequest',
+                        'Accept': 'application/json'
+                    }
+                });
+                
+                const data = await response.json();
+                
+                if (data.authenticated) {
+                    // If we're on the login page, redirect to home
+                    if (window.location.pathname === '/login' || window.location.pathname === '/login.html') {
+                        window.location.href = '/';
+                    }
+                } else if (window.location.pathname !== '/login' && window.location.pathname !== '/login.html') {
+                    // If not on login page, redirect to login
+                    window.location.href = '/login';
+                }
+            } catch (error) {
+                console.error('Session check error:', error);
+                // If there's an error, redirect to login
+                if (window.location.pathname !== '/login' && window.location.pathname !== '/login.html') {
+                    window.location.href = '/login';
+                }
+            }
+        }
     </script>
 </body>
 </html>

@@ -1,8 +1,8 @@
-from flask import Flask, request, jsonify, send_from_directory, session, redirect, url_for, make_response
+from flask import Flask, request, jsonify, send_from_directory, session, redirect, url_for 
 from flask_cors import CORS
-import os, uuid, json, numpy as np, base64
+import os, uuid, json, numpy as np
 from dotenv import load_dotenv
-from embeddings import embed_text, embed_image_bytes, TEXT_EMBEDDING_DIM, IMAGE_EMBEDDING_DIM
+from embeddings import embed_text, embed_image_bytes
 from vectorstore import VectorStore
 from pymongo import MongoClient
 from datetime import datetime, timezone, timedelta
@@ -14,7 +14,6 @@ from werkzeug.utils import secure_filename
 import tempfile
 from functools import wraps
 from sentence_transformers import SentenceTransformer
-from qdrant_client import models
 import re
 
 # Set up logging
@@ -101,7 +100,7 @@ def login_required(f):
     def decorated_function(*args, **kwargs):
         if 'user' not in session:
             # Check if this is an API endpoint by looking at the request path
-            if request.path.startswith(('/query', '/upload_products', '/query_image', '/ask_about_product', '/api/')):
+            if request.path.startswith('/query') or request.path.startswith('/upload_products') or request.path.startswith('/query_image') or request.path.startswith('/ask_about_product'):
                 return jsonify({"error": "Authentication required", "authenticated": False}), 401
             else:
                 return redirect(url_for('login'))
@@ -189,7 +188,7 @@ def create_session():
 
         try:
             # Create Qdrant collection with 512 dimensions for CLIP embeddings
-            vector_store.create_collection(collection_name, recreate=True)
+            vector_store.create_collection(collection_name, vector_size=512, recreate=True)
             logger.info(f"Created new Qdrant collection: {collection_name} with 512 dimensions")
         except Exception as qe:
             logger.error(f"Failed to create Qdrant collection: {str(qe)}")
@@ -388,22 +387,20 @@ def upload_products(session_id):
                 name = str(product.get('name', ''))
                 description = str(product.get('description', ''))
                 
-                # Get image URL from the product data
+                # Check for image file in the uploaded files
+                image_filename = product.get('image_filename') or f"product_{product_id}_{idx}.jpg"
                 image_url = product.get('image_url', '')
-                image_data = None
                 
-                # If we have an image URL, download it and store the data
-                if image_url and image_url.startswith('http'):
-                    try:
-                        # Download the image directly
-                        response = requests.get(image_url, stream=True, timeout=10)
-                        response.raise_for_status()
-                        # Store the image data as base64
-                        image_data = base64.b64encode(response.content).decode('utf-8')
-                        logger.info(f"Downloaded image from {image_url}")
-                    except Exception as e:
-                        logger.warning(f"Failed to download image from {image_url}: {str(e)}")
-                        image_url = ''  # Clear the URL if download fails
+                # If we have an uploaded file for this product, use it
+                if 'file_mapping' in locals() and image_filename in file_mapping:
+                    image_url = f"/uploads/{file_mapping[image_filename]}"
+                # If we have an image URL, download and save it
+                elif image_url:
+                    saved_image_url = save_image_from_url(image_url, session_id)
+                    if saved_image_url:
+                        image_url = saved_image_url
+                    else:
+                        logger.warning(f"Failed to download image from {image_url}")
                 
                 # Generate text embedding from product name, category, and description
                 category = str(product.get('category', '')).lower()
@@ -426,101 +423,91 @@ def upload_products(session_id):
                     logger.error(f"Failed to generate text embedding for product: {product_id}")
                     continue
                 
-                # Generate image embedding if we have image data
+                # Generate image embedding if image URL is available
                 image_embedding = None
-                if image_data:
+                if image_url and image_url.startswith('http'):
                     try:
-                        # Generate image embedding from the downloaded image data
-                        image_bytes = base64.b64decode(image_data)
-                        image_embedding = embed_image_bytes(image_bytes)
-                        if image_embedding and len(image_embedding) == 512:
-                            logger.info("Generated valid image embedding")
-                        else:
-                            logger.warning("Failed to generate valid image embedding")
-                            image_embedding = None
+                        # Download the image
+                        response = requests.get(image_url, stream=True, timeout=10)
+                        response.raise_for_status()
+                        
+                        # Generate embedding from image bytes
+                        image_embedding = embed_image_bytes(response.content)
+                        if not image_embedding:
+                            logger.warning(f"Failed to generate image embedding for product: {product_id}")
                     except Exception as e:
-                        logger.warning(f"Failed to generate image embedding: {str(e)}")
-                        image_embedding = None
+                        logger.warning(f"Error processing image for product {product_id}: {str(e)}")
                 
-                # Only add the product if we have at least a text embedding
-                if text_embedding and len(text_embedding) == TEXT_EMBEDDING_DIM:
-                    # Create vector dictionary with text and optional image embedding
-                    vector_dict = {
-                        'text': text_embedding
-                    }
-                    
-                    # Add image vector if available
-                    if image_embedding and len(image_embedding) == 512:
-                        vector_dict['image'] = image_embedding
-                    
-                    # Add product to points list
-                    points.append({
-                        'id': point_id,
-                        'payload': {
-                            'product_id': product_id,
-                            'name': name,
-                            'description': description,
-                            'category': category,
-                            'price': str(product.get('price', 'N/A')),
-                            'image_url': image_url,
-                            'image_data': image_data if image_data else ''
-                        },
-                        'vector': vector_dict
-                    })
-                    logger.info(f"Added product {product_id} with valid embeddings")
-                else:
-                    logger.warning(f"Skipping product {product_id} due to invalid text embedding")
+                if not image_embedding and os.path.exists(image_url.lstrip('/')):
+                    try:
+                        # Try to read local file
+                        with open(image_url.lstrip('/'), 'rb') as f:
+                            image_embedding = embed_image_bytes(f.read())
+                    except Exception as e:
+                        logger.warning(f"Error reading local image for product {product_id}: {str(e)}")
+                
+                if not image_embedding:
+                    # If we couldn't get image embedding, use text embedding as fallback
+                    image_embedding = text_embedding
+                
+                # Prepare product payload with image_url
+                payload = {
+                    "product_id": product_id,
+                    "name": name,
+                    "description": description,
+                    "price": str(product.get('price', '')),
+                    "category": category,
+                    "image_url": image_url,  # This will be either the original URL or the uploaded file URL
+                    "created_at": datetime.now(timezone.utc).isoformat()
+                }
+                
+                # Create point with both text and image vectors
+                point = {
+                    "id": point_id,  # Use the generated UUID as the point ID
+                    "vector": {
+                        "text": text_embedding,
+                        "image": image_embedding
+                    },
+                    "payload": payload
+                }
+                points.append(point)
                 
             except Exception as e:
-                logger.error(f"Error processing product {idx}: {str(e)}")
+                logger.error(f"Error processing product {product.get('product_id', 'unknown')}: {str(e)}", exc_info=True)
                 continue
         
-        # Create collection with both text and image vectors
+        if not points:
+            return jsonify({"error": "No valid products to upload"}), 400
+            
+        # Insert points into Qdrant
         try:
-            vector_store.create_collection(collection_name=collection_name, recreate=True)
-            logger.info(f"Created collection {collection_name} with text vectors of size {TEXT_EMBEDDING_DIM} and image vectors of size {IMAGE_EMBEDDING_DIM}")
-        except Exception as e:
-            logger.error(f"Error creating collection: {str(e)}")
-            return jsonify({"error": f"Failed to create collection: {str(e)}"}), 500
-        
-        # Process products in batches
-        batch_size = 5  # Reduced batch size for better error handling
-        success_count = 0
-        error_count = 0
-        
-        for i in range(0, len(points), batch_size):
-            batch = points[i:i + batch_size]
-            try:
-                # Log batch details for debugging
-                for point in batch:
-                    logger.info(f"Point ID: {point['id']}")
-                    logger.info(f"Text vector length: {len(point['vector']['text'])}")
-                    if 'image' in point['vector']:
-                        logger.info(f"Image vector length: {len(point['vector']['image'])}")
+            success = vector_store.upsert_points(
+                collection_name=collection_name,
+                points=points
+            )
+            
+            if not success:
+                raise Exception("Failed to insert points into vector store")
                 
-                # Add batch to Qdrant
-                success = vector_store.upsert_points(collection_name, batch)
-                if success:
-                    success_count += len(batch)
-                    logger.info(f"Successfully added batch {i//batch_size + 1}")
-                else:
-                    error_count += len(batch)
-                    logger.error(f"Failed to add batch {i//batch_size + 1}")
-            except Exception as e:
-                error_msg = f"Error adding batch {i//batch_size + 1}: {str(e)}"
-                logger.error(error_msg, exc_info=True)
-                error_count += len(batch)
-        
-        # Return success/error counts
-        return jsonify({
-            "message": f"Successfully processed {success_count} products. {error_count} failed.",
-            "success_count": success_count,
-            "error_count": error_count
-        })
-        
+            # Update session with product count
+            sessions_col.update_one(
+                {"_id": session_id},
+                {"$inc": {"product_count": len(points)}},
+                upsert=True
+            )
+            
+            return jsonify({
+                "message": f"Successfully uploaded {len(points)} products",
+                "count": len(points)
+            })
+            
+        except Exception as e:
+            logger.error(f"Error storing products in vector store: {str(e)}", exc_info=True)
+            return jsonify({"error": f"Failed to store products in vector database: {str(e)}"}), 500
+            
     except Exception as e:
         logger.error(f"Error in upload_products: {str(e)}", exc_info=True)
-        return jsonify({"error": f"An error occurred: {str(e)}"}), 500
+        return jsonify({"error": "An error occurred while processing your request"}), 500
 
 @app.route('/query', methods=['POST'])
 @login_required
@@ -618,7 +605,7 @@ def handle_product_search(query: str, session_id: str, collection_name: str):
                         filtered_results.append(result)
                 
                 if filtered_results:
-                    return format_product_results(filtered_results[:10], session_id)  # Return top 10 filtered results
+                    return format_product_results(filtered_results[:10])  # Return top 10 filtered results
         
         # If no category match or no results from category search, try exact match
         exact_matches = vector_store.search(
@@ -630,7 +617,7 @@ def handle_product_search(query: str, session_id: str, collection_name: str):
         
         # If we found an exact match, return only that product
         if exact_matches and hasattr(exact_matches[0], 'score') and exact_matches[0].score > 0.9:
-            return format_product_results([exact_matches[0]], session_id)
+            return format_product_results([exact_matches[0]])
             
         # If no exact match, proceed with regular semantic search
         if 'query_embedding' not in locals():
@@ -647,7 +634,7 @@ def handle_product_search(query: str, session_id: str, collection_name: str):
         
         # If we have results, return them
         if results:
-            return format_product_results(results, session_id)
+            return format_product_results(results)
             
         return jsonify({"message": "No matching products found"}), 404
         
@@ -683,7 +670,7 @@ def handle_product_question(question: str, session_id: str, collection_name: str
             })
             
         # Format the results
-        formatted_results = format_product_results(results, session_id)
+        formatted_results = format_product_results(results)
         
         # For now, just return the top result as the answer
         if formatted_results and len(formatted_results) > 0:
@@ -702,8 +689,8 @@ def handle_product_question(question: str, session_id: str, collection_name: str
         logger.error(f"Error in handle_product_question: {str(e)}", exc_info=True)
         return jsonify({"error": "An error occurred while processing your question"}), 500
 
-def format_product_results(results, session_id):
-    """Format product results for the frontend with proper image URLs from Qdrant"""
+def format_product_results(results):
+    """Format product results for the frontend"""
     if not results:
         return []
         
@@ -727,10 +714,6 @@ def format_product_results(results, session_id):
                 else:
                     # If result is already in product format
                     if all(k in result for k in ['name', 'price', 'category']):
-                        # Add session_id to image URL if it exists
-                        if 'image_url' in result and result['image_url']:
-                            if not result['image_url'].startswith('http') and not result['image_url'].startswith('/api/'):
-                                result['image_url'] = f"/api/images/{result.get('id', result.get('product_id', ''))}?session_id={session_id}"
                         formatted_results.append(result)
                         continue
                     payload = result
@@ -755,32 +738,20 @@ def format_product_results(results, session_id):
             percentage_score = min(100.0, max(0.0, score * 100))
             
             # Extract product details with proper defaults
-            product_id = str(payload.get('product_id', result_id))
-            
             product = {
-                'id': product_id,
+                'id': str(payload.get('product_id', result_id)),
                 'name': str(payload.get('name', 'Unnamed Product')).strip(),
                 'description': str(payload.get('description', '')).strip(),
                 'price': str(payload.get('price', 'N/A')).strip(),
                 'category': str(payload.get('category', 'Uncategorized')).strip(),
+                'image_url': str(payload.get('image_url', '')).strip(),
                 'score': round(percentage_score, 2)  # Round to 2 decimal places
             }
             
-            # Handle image URL - prioritize Qdrant image data over external URLs
-            image_data = payload.get('image_data', '')
-            if image_data and image_data.strip():
-                # Image is stored in Qdrant, use our API endpoint
-                product['image_url'] = f"/api/images/{product_id}?session_id={session_id}"
-                product['has_image'] = True
-            else:
-                # Fallback to external image URL if available
-                external_url = str(payload.get('image_url', '')).strip()
-                if external_url and external_url.startswith(('http://', 'https://')):
-                    product['image_url'] = external_url
-                    product['has_image'] = True
-                else:
-                    product['image_url'] = ''
-                    product['has_image'] = False
+            # Ensure image path is in the correct format
+            if (product['image_url'] and 
+                not product['image_url'].startswith(('http://', 'https://', '/'))):
+                product['image_url'] = f"/{product['image_url'].lstrip('/')}"
                 
             formatted_results.append(product)
             
@@ -805,13 +776,317 @@ def query_image(session_id):
     file = request.files['file']
     if file.filename == '':
         return jsonify({"error": "No selected file"}), 400
+        
+    # Create a unique filename to prevent collisions
+    temp_filename = f"{uuid.uuid4()}_{secure_filename(file.filename)}"
+    temp_dir = os.path.join(app.config['UPLOAD_FOLDER'], 'temp')
+    os.makedirs(temp_dir, exist_ok=True)
+    filepath = os.path.join(temp_dir, temp_filename)
     
     try:
-        # Read the file directly into memory instead of saving to disk
-        image_data = file.read()
-        if not image_data:
-            raise Exception("File is empty")
+        # Save the file temporarily
+        try:
+            file.save(filepath)
+            logger.info(f"Saved uploaded file to {filepath}")
+            if not os.path.exists(filepath):
+                raise Exception("File was not saved correctly")
+        except Exception as e:
+            logger.error(f"Error saving temporary file: {str(e)}")
+            return jsonify({"error": "Failed to save uploaded file"}), 500
+        
+        try:
+            # Get the collection name for this session
+            session_data = sessions_col.find_one({"_id": session_id})
+            if not session_data or 'collection_name' not in session_data:
+                return jsonify({"error": "No products found for this session"}), 404
+                
+            collection_name = session_data['collection_name']
             
+            # Load CLIP model for visual similarity search
+            try:
+                import torch
+                from transformers import CLIPModel, CLIPProcessor
+                from PIL import Image
+                
+                # Initialize CLIP model and processor (this will be cached after first load)
+                device = "cuda" if torch.cuda.is_available() else "cpu"
+                if not hasattr(query_image, 'model'):
+                    query_image.model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(device)
+                    query_image.processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+                    query_image.device = device
+                
+                # Process the uploaded image
+                image = Image.open(filepath).convert("RGB")
+                
+                # STEP 1: Detect product category from the image using CLIP text-image similarity
+                jewelry_categories = [
+                    "necklace", "ring", "bracelet", "earring", "anklet", 
+                    "pendant", "bangle", "brooch", "choker", "watch"
+                ]
+                
+                # Create text prompts for category detection
+                category_texts = [f"a {category} jewelry" for category in jewelry_categories]
+                
+                # Process both image and text through CLIP
+                inputs = query_image.processor(
+                    text=category_texts, 
+                    images=image, 
+                    return_tensors="pt", 
+                    padding=True
+                )
+                inputs = {k: v.to(query_image.device) for k, v in inputs.items()}
+                
+                # Get similarity scores between image and category texts
+                with torch.no_grad():
+                    outputs = query_image.model(**inputs)
+                    logits_per_image = outputs.logits_per_image
+                    probs = logits_per_image.softmax(dim=1)
+                
+                # Find the most likely category
+                best_category_idx = probs.argmax().item()
+                best_category = jewelry_categories[best_category_idx]
+                confidence = probs[0][best_category_idx].item()
+                
+                logger.info(f"Detected category: {best_category} with confidence: {confidence:.3f}")
+                
+                # STEP 2: Get image embedding for visual similarity
+                image_inputs = query_image.processor(images=image, return_tensors="pt", padding=True)
+                image_inputs = {k: v.to(query_image.device) for k, v in image_inputs.items()}
+                
+                with torch.no_grad():
+                    image_features = query_image.model.get_image_features(**image_inputs)
+                
+                # Convert to numpy array and ensure correct shape
+                query_embedding = image_features.cpu().numpy().astype('float32')
+                
+                # Ensure we have a 1D array of the correct dimension
+                if len(query_embedding.shape) > 1:
+                    query_embedding = query_embedding.reshape(-1)
+                
+                # Check dimension
+                if len(query_embedding) != 512:  # CLIP embedding dimension
+                    logger.warning(f"Unexpected query embedding dimension: {len(query_embedding)}")
+                    # Truncate or pad if necessary
+                    if len(query_embedding) > 512:
+                        query_embedding = query_embedding[:512]
+                    else:
+                        padding = np.zeros(512 - len(query_embedding), dtype='float32')
+                        query_embedding = np.concaten([query_embedding, padding])
+                
+                # Normalize the embedding
+                norm = np.linalg.norm(query_embedding)
+                if norm > 0:
+                    query_embedding = (query_embedding / norm).tolist()
+                else:
+                    query_embedding = query_embedding.tolist()
+                
+                # STEP 3: Search for visually similar products (using existing VectorStore search method)
+                logger.info(f"Searching for similar images with detected category: {best_category}")
+                
+                # Use the existing search method without filter_categories parameter
+                search_results = vector_store.search(
+                    collection_name=collection_name,
+                    query_vector=query_embedding,
+                    vector_name="image",
+                    top_k=20,  # Get more results for better filtering
+                    score_threshold=0.2  # Lower threshold for initial search
+                )
+                
+                # Log the search results for debugging
+                if search_results:
+                    logger.info(f"Found {len(search_results)} potential matches")
+                else:
+                    logger.warning("No visually similar products found")
+                
+                if not search_results:
+                    return jsonify({
+                        "message": "No visually similar products found. Try adjusting your search criteria.", 
+                        "results": []
+                    })
+                
+                # STEP 4: Post-process results with STRICT category filtering
+                formatted_results = []
+                category_matches = []
+                seen_products = set()  # Track seen products for deduplication
+
+                # Define related categories for more flexible matching
+                related_categories = {
+                    'necklace': ['necklace', 'pendant', 'chain'],
+                    'pendant': ['pendant', 'necklace', 'chain'], 
+                    'ring': ['ring', 'band'],
+                    'bracelet': ['bracelet', 'bangle'],
+                    'earring': ['earring', 'stud'],
+                    'anklet': ['anklet'],
+                    'watch': ['watch'],
+                    'brooch': ['brooch'],
+                    'choker': ['choker', 'necklace']
+                }
+
+                # Get related categories for the detected category
+                target_categories = related_categories.get(best_category.lower(), [best_category.lower()])
+                logger.info(f"Looking for products in categories: {target_categories}")
+
+                for result in search_results:
+                    try:
+                        if hasattr(result, 'score'):
+                            # Qdrant ScoredPoint object
+                            payload = getattr(result, 'payload', {}) or {}
+                            base_score = float(getattr(result, 'score', 0))
+                            result_id = str(getattr(result, 'id', ''))
+                        else:
+                            # Dictionary format
+                            payload = result.get('payload', {})
+                            base_score = float(result.get('score', 0))
+                            result_id = str(result.get('id', ''))
+                        
+                        if not payload:
+                            continue
+                        
+                        # Create unique identifier for deduplication
+                        product_key = f"{payload.get('name', '')}_{payload.get('product_id', '')}"
+                        if product_key in seen_products:
+                            continue
+                        seen_products.add(product_key)
+                        
+                        # Get product details for category matching
+                        product_category = str(payload.get('category', '')).lower().strip()
+                        product_name = str(payload.get('name', '')).lower().strip()
+                        product_desc = str(payload.get('description', '')).lower().strip()
+                        
+                        # STRICT category matching - only include if it matches target categories
+                        is_category_match = False
+                        
+                        # Check if any target category appears in the product details
+                        for target_cat in target_categories:
+                            if (target_cat in product_category or 
+                                target_cat in product_name or 
+                                target_cat in product_desc or
+                                # Check for plural forms
+                                target_cat + 's' in product_category or
+                                target_cat + 's' in product_name):
+                                is_category_match = True
+                                break
+                        
+                        # If confidence is high, ONLY include category matches
+                        if confidence > 0.6 and not is_category_match:
+                            continue
+                        
+                        # If confidence is medium, be more selective
+                        elif confidence > 0.4 and not is_category_match and base_score < 0.7:
+                            continue
+                            
+                        # If confidence is low, include high-scoring visual matches
+                        elif confidence <= 0.4 and not is_category_match and base_score < 0.8:
+                            continue
+                        
+                        # Calculate final score with category boost
+                        final_score = base_score
+                        if is_category_match:
+                            final_score *= (1.5 + confidence)  # Higher boost for higher confidence
+                        
+                        # Convert score to percentage format
+                        percentage_score = min(100.0, max(0.0, final_score * 100))
+                        
+                        formatted_result = {
+                            'id': str(payload.get('product_id', result_id)),
+                            'name': str(payload.get('name', 'Unnamed Product')),
+                            'description': str(payload.get('description', '')),
+                            'price': str(payload.get('price', 'N/A')),
+                            'category': str(payload.get('category', 'Uncategorized')),
+                            'image_url': str(payload.get('image_url', '')),
+                            'score': round(percentage_score, 2),
+                            'is_category_match': is_category_match
+                        }
+                        
+                        category_matches.append(formatted_result)
+                        
+                        # Stop once we have enough good matches
+                        if len(category_matches) >= 8:
+                            break
+                            
+                    except Exception as e:
+                        logger.error(f"Error formatting result: {str(e)}", exc_info=True)
+                        continue
+
+                # Sort by score
+                category_matches.sort(key=lambda x: x.get('score', 0), reverse=True)
+
+                # Take top 5 results
+                formatted_results = category_matches[:5]
+
+                if not formatted_results:
+                    logger.warning("No valid products found after strict filtering")
+                    return jsonify({
+                        "message": f"No {best_category} products found in your catalog. Try with a different image or check if you have {best_category} products uploaded.",
+                        "detected_category": best_category,
+                        "confidence": round(confidence * 100, 1),
+                        "results": []
+                    })
+
+                # Create response message
+                category_count = len([r for r in formatted_results if r.get('is_category_match')])
+                total_count = len(formatted_results)
+
+                if confidence > 0.6:
+                    if category_count == total_count:
+                        message = f"Found {total_count} {best_category}(s) matching your image"
+                    else:
+                        message = f"Found {category_count} {best_category}(s) and {total_count - category_count} similar items"
+                elif confidence > 0.4:
+                    message = f"Found {total_count} products similar to your {best_category} image"
+                else:
+                    message = f"Found {total_count} visually similar products"
+
+                # Remove the is_category_match flag from final results (internal use only)
+                for result in formatted_results:
+                    result.pop('is_category_match', None)
+
+                logger.info(f"Returning {len(formatted_results)} strictly filtered results with {category_count} category matches")
+                return jsonify({
+                    "message": message,
+                    "detected_category": best_category,
+                    "confidence": round(confidence * 100, 1),
+                    "results": formatted_results
+                })
+                    
+            except Exception as e:
+                logger.error(f"Error processing image with CLIP: {str(e)}", exc_info=True)
+                return jsonify({
+                    "error": "Failed to process image",
+                    "details": str(e),
+                    "results": []
+                }), 500
+            
+        except ValueError as ve:
+            logger.error(f"Validation error in query_image: {str(ve)}")
+            return jsonify({"error": str(ve)}), 400
+        except Exception as e:
+            logger.error(f"Error in query_image: {str(e)}", exc_info=True)
+            return jsonify({"error": "An error occurred while processing your request"}), 500
+            
+    finally:
+        # Clean up the temporary file
+        try:
+            if os.path.exists(filepath):
+                os.remove(filepath)
+        except Exception as e:
+            logger.warning(f"Error removing temporary file {filepath}: {str(e)}")
+
+# ---------------------------
+# Product Question Answering
+# ---------------------------
+@app.route("/ask_about_product", methods=["POST"])
+@login_required
+def ask_about_product():
+    try:
+        data = request.get_json()
+        question = data.get("question")
+        product_id = data.get("product_id")
+        session_id = data.get("session_id")
+        
+        if not all([question, product_id, session_id]):
+            return jsonify({"error": "Missing required fields"}), 400
+        
         # Get session and collection
         session_data = sessions_col.find_one({"_id": session_id})
         if not session_data or 'collection_name' not in session_data:
@@ -819,197 +1094,33 @@ def query_image(session_id):
             
         collection_name = session_data['collection_name']
         
-        # Generate embedding for the image
-        try:
-            # Convert image to base64 for storage
-            image_base64 = base64.b64encode(image_data).decode('utf-8')
+        # Generate embedding for the question
+        question_embedding = generate_embedding(question)
+        
+        # Search for relevant products
+        results = vector_store.search(
+            collection_name=collection_name,
+            query_vector=question_embedding,
+            top_k=3,
+            score_threshold=0.3
+        )
+        
+        if not results:
+            return jsonify({"error": "No relevant products found to answer your question"}), 404
             
-            # Generate image embedding
-            image_embedding = embed_image_bytes(image_data)
-            
-            if image_embedding is None or len(image_embedding) != 512:
-                raise ValueError("Failed to generate valid image embedding")
-                
-            # Search for visually similar products
-            results = vector_store.search(
-                collection_name=collection_name,
-                query_vector=image_embedding,
-                vector_name="image",
-                top_k=3,
-                score_threshold=0.3
-            )
-            
-            if not results:
-                return jsonify({"error": "No visually similar products found"}), 404
-                
-            # Format the results for the response
-            formatted_results = format_product_results(results, session_id)
-            
-            # Return the visually similar products
-            return jsonify({
-                "message": "Here are some visually similar products:",
-                "results": formatted_results
-            })
-            
-        except Exception as e:
-            logger.error(f"Error in image processing: {str(e)}", exc_info=True)
-            return jsonify({"error": f"Failed to process image: {str(e)}"}), 500
-            
+        # Format the results for the response
+        formatted_results = format_product_results(results)
+        
+        # For now, just return the top relevant products
+        # In a real app, you might want to use a language model to generate a more detailed answer
+        return jsonify({
+            "message": "Here are some products that might help answer your question:",
+            "results": formatted_results
+        })
+        
     except Exception as e:
-        logger.error(f"Error in query_image: {str(e)}", exc_info=True)
+        logger.error(f"Error in ask_about_product: {str(e)}", exc_info=True)
         return jsonify({"error": f"An error occurred: {str(e)}"}), 500
-
-# ---------------------------
-# Image serving endpoint - FIXED VERSION
-# ---------------------------
-@app.route('/api/images/<product_id>')
-@login_required
-def get_image(product_id):
-    """Serve image data directly from Qdrant for a given product ID"""
-    try:
-        # Get the session ID from the query parameters
-        session_id = request.args.get('session_id')
-        if not session_id:
-            return jsonify({"error": "Session ID is required"}), 400
-            
-        # Get the collection name for this session
-        session_data = sessions_col.find_one({"_id": session_id})
-        if not session_data or 'collection_name' not in session_data:
-            return jsonify({"error": "Invalid session"}), 404
-            
-        collection_name = session_data['collection_name']
-        
-        # First try to get the point directly by ID (as string)
-        try:
-            point = vector_store.client.retrieve(
-                collection_name=collection_name,
-                ids=[str(product_id)],  # Ensure ID is string
-                with_payload=True,
-                with_vectors=False
-            )
-            if point and len(point) > 0:
-                payload = point[0].payload or {}
-                if not payload and hasattr(point[0], 'get'):
-                    payload = {k: v for k, v in point[0].items() if k != 'payload'}
-                if payload:
-                    return _serve_image(payload, product_id)
-        except Exception as e:
-            logger.debug(f"Could not retrieve point directly: {str(e)}")
-        
-        # Try searching in the payload with different field names
-        search_fields = ["product_id", "id", "_id", "name"]
-        
-        for field in search_fields:
-            try:
-                results = vector_store.client.scroll(
-                    collection_name=collection_name,
-                    scroll_filter=models.Filter(
-                        must=[
-                            models.FieldCondition(
-                                key=f"payload.{field}",
-                                match=models.MatchValue(value=product_id)
-                            )
-                        ]
-                    ),
-                    limit=1,
-                    with_payload=True,
-                    with_vectors=False
-                )
-                
-                if results and len(results[0]) > 0:
-                    payload = results[0][0].payload or {}
-                    if not payload and hasattr(results[0][0], 'get'):
-                        payload = {k: v for k, v in results[0][0].items() if k != 'payload'}
-                    if payload:
-                        return _serve_image(payload, product_id)
-                        
-            except Exception as e:
-                logger.debug(f"Search by {field} failed: {str(e)}")
-                continue
-        
-        # If still not found, try to find by partial match in name or description
-        try:
-            all_products = vector_store.client.scroll(
-                collection_name=collection_name,
-                limit=100,  # Adjust based on expected collection size
-                with_payload=True,
-                with_vectors=False
-            )
-            
-            for product in all_products[0]:
-                payload = product.payload or {}
-                if not payload and hasattr(product, 'get'):
-                    payload = {k: v for k, v in product.items() if k != 'payload'}
-                
-                # Try to find a match in common fields
-                for field in ['name', 'description', 'title', 'product_name']:
-                    if field in payload and str(product_id).lower() in str(payload[field]).lower():
-                        return _serve_image(payload, product_id)
-                
-                # Try direct ID match in different formats
-                for id_field in ['id', 'product_id', '_id']:
-                    if id_field in payload and str(payload[id_field]) == str(product_id):
-                        return _serve_image(payload, product_id)
-            
-            logger.warning(f"Product {product_id} not found in collection {collection_name}")
-            return jsonify({"error": "Product not found"}), 404
-            
-        except Exception as e:
-            logger.error(f"Error retrieving products from collection: {str(e)}", exc_info=True)
-            return jsonify({"error": "Failed to search products"}), 500
-            
-    except Exception as e:
-        logger.error(f"Error in get_image: {str(e)}", exc_info=True)
-        return jsonify({"error": "An error occurred while processing your request"}), 500
-
-
-def _serve_image(payload, product_id):
-    """Helper method to serve image from payload"""
-    if not payload:
-        logger.warning(f"No payload found for product {product_id}")
-        return jsonify({"error": "Product data not found"}), 404
-        
-    # Get the base64-encoded image data
-    image_data = payload.get('image_data', '')
-    if not image_data:
-        logger.warning(f"No image data found for product {product_id}")
-        return jsonify({"error": "No image data available"}), 404
-        
-    # Clean up the base64 data if it contains data URL prefix
-    if image_data.startswith('data:image/'):
-        # Extract just the base64 part
-        if ',' in image_data:
-            image_data = image_data.split(',', 1)[1]
-    
-    # Decode the base64 data
-    try:
-        image_bytes = base64.b64decode(image_data)
-        if not image_bytes:
-            raise ValueError("Decoded image data is empty")
-    except Exception as e:
-        logger.error(f"Error decoding base64 image data for product {product_id}: {str(e)}")
-        return jsonify({"error": "Invalid image data"}), 400
-    
-    # Determine content type based on image signature
-    content_type = 'image/jpeg'  # Default
-    if image_bytes.startswith(b'\xFF\xD8\xFF'):
-        content_type = 'image/jpeg'
-    elif image_bytes.startswith(b'\x89PNG\r\n\x1A\n'):
-        content_type = 'image/png'
-    elif image_bytes.startswith(b'GIF87a') or image_bytes.startswith(b'GIF89a'):
-        content_type = 'image/gif'
-    elif image_bytes.startswith(b'RIFF') and b'WEBP' in image_bytes[:12]:
-        content_type = 'image/webp'
-    
-    # Create response with proper headers
-    response = make_response(image_bytes)
-    response.headers.set('Content-Type', content_type)
-    response.headers.set('Content-Length', len(image_bytes))
-    response.headers.set('Cache-Control', 'public, max-age=31536000')  # Cache for 1 year
-    response.headers.set('Accept-Ranges', 'bytes')
-    
-    logger.info(f"Successfully served image for product {product_id}, size: {len(image_bytes)} bytes, type: {content_type}")
-    return response
 
 # ---------------------------
 # Global error handlers
@@ -1017,14 +1128,14 @@ def _serve_image(payload, product_id):
 @app.errorhandler(404)
 def not_found(error):
     # Return JSON for API endpoints, HTML for others
-    if request.path.startswith(('/query', '/upload_products', '/query_image', '/ask_about_product', '/api/')):
+    if request.path.startswith('/query') or request.path.startswith('/upload_products') or request.path.startswith('/query_image') or request.path.startswith('/ask_about_product'):
         return jsonify({"error": "Endpoint not found", "status": 404}), 404
     return error, 404
 
 @app.errorhandler(500)
 def internal_error(error):
     # Return JSON for API endpoints, HTML for others
-    if request.path.startswith(('/query', '/upload_products', '/query_image', '/ask_about_product', '/api/')):
+    if request.path.startswith('/query') or request.path.startswith('/upload_products') or request.path.startswith('/query_image') or request.path.startswith('/ask_about_product'):
         return jsonify({"error": "Internal server error", "status": 500}), 500
     return error, 500
 
@@ -1032,46 +1143,21 @@ def internal_error(error):
 def handle_exception(e):
     # Handle any unhandled exceptions
     logger.error(f"Unhandled exception: {str(e)}", exc_info=True)
-    if request.path.startswith(('/query', '/upload_products', '/query_image', '/ask_about_product', '/api/')):
+    if request.path.startswith('/query') or request.path.startswith('/upload_products') or request.path.startswith('/query_image') or request.path.startswith('/ask_about_product'):
         return jsonify({"error": "An unexpected error occurred", "details": str(e)}), 500
     return e, 500
-
-# ---------------------------
-# Graceful shutdown handler
-# ---------------------------
-def handle_shutdown(signum, frame):
-    logger.info("Shutting down server...")
-    # Add any cleanup code here if needed
-    import sys
-    sys.exit(0)
 
 # ---------------------------
 # Run server
 # ---------------------------
 if __name__ == "__main__":
-    import signal
-    from werkzeug.serving import is_running_from_reloader
+    # Ensure upload directory exists
+    os.makedirs(app.config["UPLOAD_FOLDER"], exist_ok=True)
     
-    # Only run this once, not in the reloader process
-    if not is_running_from_reloader():
-        # Ensure upload directory exists
-        os.makedirs(app.config["UPLOAD_FOLDER"], exist_ok=True)
-        
-        # Register signal handlers for graceful shutdown
-        signal.signal(signal.SIGINT, handle_shutdown)
-        signal.signal(signal.SIGTERM, handle_shutdown)
-        
-        # Print startup message with the URL
-        print("\n" + "="*50)
-        print(f"Starting server at http://localhost:5000")
-        print("Images will be served directly from Qdrant via /api/images/<product_id>")
-        print("="*50 + "\n")
+    # Print startup message with the URL
+    print("\n" + "="*50)
+    print(f"Starting server at http://localhost:5000")
+    print("="*50 + "\n")
     
-    # Run the app with threaded=True to handle multiple requests
-    app.run(host='0.0.0.0', 
-            port=5000, 
-            debug=True, 
-            use_reloader=True, 
-            threaded=True,
-            use_debugger=True,
-            passthrough_errors=True)
+    # Run the app
+    app.run(host='0.0.0.0', port=5000, debug=True, use_reloader=True)

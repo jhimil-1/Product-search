@@ -2,8 +2,12 @@ from qdrant_client import QdrantClient
 from qdrant_client.http import models
 from qdrant_client.http.exceptions import UnexpectedResponse
 import logging
-from typing import Optional, List, Dict, Any
+from embeddings import TEXT_EMBEDDING_DIM, IMAGE_EMBEDDING_DIM
+from typing import Optional, List, Dict, Any, Union, Tuple
 import uuid
+import base64
+from io import BytesIO
+from PIL import Image
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -34,7 +38,11 @@ class VectorStore:
                 port=self.port,
                 api_key=self.api_key,
                 prefer_grpc=True,  # gRPC is more efficient for cloud connections
-                timeout=10.0
+                timeout=10.0,
+                grpc_options={
+                    "grpc.keepalive_time_ms": 30000,  # Send keepalive pings every 30 seconds
+                    "grpc.keepalive_timeout_ms": 10000,  # Wait 10 seconds for keepalive response
+                }
             )
             
             # Test connection
@@ -50,7 +58,7 @@ class VectorStore:
             logger.error(error_msg)
             raise
 
-    def create_collection(self, collection_name: str, vector_size: int = 512, recreate: bool = False) -> None:
+    def create_collection(self, collection_name: str, recreate: bool = False) -> bool:
         """
         Create a new collection with the given name and vector size.
         
@@ -58,32 +66,272 @@ class VectorStore:
             collection_name: Name of the collection to create
             vector_size: Dimensionality of the vectors (default: 512 for CLIP model)
             recreate: If True, delete existing collection with the same name
+            
+        Returns:
+            bool: True if collection was created successfully, False otherwise
         """
         try:
-            # Delete existing collection if recreate is True
-            if recreate:
-                self.delete_collection(collection_name)
+            # Check if collection exists
+            collections = self.client.get_collections()
+            collection_exists = any(collection.name == collection_name for collection in collections.collections)
+            
+            # Delete existing collection if recreate is True or if it exists
+            if recreate or collection_exists:
+                try:
+                    self.client.delete_collection(collection_name)
+                    logger.info(f"Deleted existing collection: {collection_name}")
+                except Exception as e:
+                    if "not found" not in str(e).lower():
+                        logger.warning(f"Error deleting collection {collection_name}: {str(e)}")
             
             # Create new collection with both text and image vectors
-            self.client.recreate_collection(
+            self.client.create_collection(
                 collection_name=collection_name,
                 vectors_config={
                     "text": models.VectorParams(
-                        size=vector_size,  # CLIP uses 512-dimensional vectors
+                        size=TEXT_EMBEDDING_DIM,  # SentenceTransformer uses 384-dimensional vectors
                         distance=models.Distance.COSINE
                     ),
                     "image": models.VectorParams(
-                        size=vector_size,  # Same size as text for CLIP
+                        size=IMAGE_EMBEDDING_DIM,  # CLIP uses 512-dimensional vectors
                         distance=models.Distance.COSINE
                     )
                 }
             )
-            logger.info(f"Created new collection: {collection_name} with text and image vectors of size {vector_size}")
+            logger.info(f"Created new collection: {collection_name} with text vectors of size {TEXT_EMBEDDING_DIM} and image vectors of size {IMAGE_EMBEDDING_DIM}")
+            
+            # Create payload indexes for faster filtering
+            try:
+                # Index for top-level fields
+                for field, schema_type in [
+                    ("product_id", models.PayloadSchemaType.KEYWORD),
+                    ("category", models.PayloadSchemaType.KEYWORD),
+                    ("name", models.PayloadSchemaType.TEXT)
+                ]:
+                    try:
+                        self.client.create_payload_index(
+                            collection_name=collection_name,
+                            field_name=field,
+                            field_schema=models.TextIndexParams(
+                                type="text",
+                                tokenizer=models.TokenizerType.WORD,
+                                min_token_len=2,
+                                max_token_len=20,
+                                lowercase=True
+                            ) if schema_type == models.PayloadSchemaType.TEXT else schema_type
+                        )
+                        logger.info(f"Created index for top-level field: {field}")
+                    except Exception as e:
+                        logger.warning(f"Could not create index for '{field}': {str(e)}")
+                
+                # Index for nested payload fields
+                for field in ["product_id", "name", "category"]:
+                    try:
+                        self.client.create_payload_index(
+                            collection_name=collection_name,
+                            field_name=f"payload.{field}",
+                            field_schema=models.TextIndexParams(
+                                type="text",
+                                tokenizer=models.TokenizerType.WORD,
+                                min_token_len=2,
+                                max_token_len=20,
+                                lowercase=True
+                            ) if field != "product_id" else models.PayloadSchemaType.KEYWORD
+                        )
+                        logger.info(f"Created index for nested field: payload.{field}")
+                    except Exception as e:
+                        logger.warning(f"Could not create index for 'payload.{field}': {str(e)}")
+                
+                logger.info(f"Successfully created all payload indexes for collection: {collection_name}")
+                
+            except Exception as e:
+                logger.error(f"Error creating payload indexes: {str(e)}", exc_info=True)
+                # Don't fail the whole operation if indexing fails
+            
+            return True
             
         except Exception as e:
-            error_msg = f"Failed to create collection {collection_name}"
-            logger.error(f"{error_msg}: {str(e)}")
-            raise Exception(f"{error_msg}: {str(e)}")
+            logger.error(f"Error creating collection {collection_name}: {str(e)}", exc_info=True)
+            return False
+    
+    def upsert_points(self, collection_name: str, points: List[Dict]) -> bool:
+        """
+        Upsert points into the collection with proper vector validation
+        
+        Args:
+            collection_name: Name of the collection
+            points: List of point dictionaries with 'id', 'vector', and 'payload' keys
+            
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        if not points:
+            logger.warning("No points to upsert")
+            return False
+            
+        try:
+            # Convert points to Qdrant PointStruct format
+            qdrant_points = []
+            
+            for point in points:
+                try:
+                    # Ensure vectors are the correct length (512)
+                    vectors = {}
+                    
+                    # Process text vector
+                    if 'text' in point['vector'] and len(point['vector']['text']) == TEXT_EMBEDDING_DIM:
+                        vectors['text'] = point['vector']['text']
+                    else:
+                        logger.warning(f"Invalid text vector in point {point.get('id')} - expected {TEXT_EMBEDDING_DIM} dimensions, got {len(point['vector']['text']) if 'text' in point['vector'] else 'none'}")
+                        continue
+                        
+                    # Process image vector if present
+                    if 'image' in point['vector'] and point['vector']['image'] and len(point['vector']['image']) == 512:
+                        vectors['image'] = point['vector']['image']
+                    
+                    # Create point with validated vectors
+                    qdrant_point = models.PointStruct(
+                        id=point['id'],
+                        vector=vectors,
+                        payload=point['payload']
+                    )
+                    qdrant_points.append(qdrant_point)
+                    
+                except Exception as e:
+                    logger.error(f"Error processing point {point.get('id')}: {str(e)}", exc_info=True)
+                    continue
+            
+            if not qdrant_points:
+                logger.error("No valid points to upsert after validation")
+                return False
+            
+            # Upsert the points in batches of 50
+            batch_size = 50
+            for i in range(0, len(qdrant_points), batch_size):
+                batch = qdrant_points[i:i + batch_size]
+                self.client.upsert(
+                    collection_name=collection_name,
+                    points=batch,
+                    wait=True
+                )
+                logger.info(f"Upserted batch {i//batch_size + 1} with {len(batch)} points")
+            
+            logger.info(f"Successfully upserted {len(qdrant_points)} points to {collection_name}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error in upsert_points: {str(e)}", exc_info=True)
+            return False
+    
+    @staticmethod
+    def _image_to_base64(image_data: Union[bytes, Image.Image], max_size: int = 1024) -> str:
+        """Convert image to base64 string with resizing"""
+        try:
+            if isinstance(image_data, bytes):
+                img = Image.open(BytesIO(image_data)).convert('RGB')
+            else:
+                img = image_data.convert('RGB')
+                
+            # Resize image if it's too large
+            if max(img.size) > max_size:
+                ratio = max_size / max(img.size)
+                new_size = (int(img.size[0] * ratio), int(img.size[1] * ratio))
+                img = img.resize(new_size, Image.Resampling.LANCZOS)
+                
+            # Convert to base64
+            buffered = BytesIO()
+            img.save(buffered, format="JPEG", quality=85)
+            return f"data:image/jpeg;base64,{base64.b64encode(buffered.getvalue()).decode('utf-8')}"
+            
+        except Exception as e:
+            logger.error(f"Error processing image: {str(e)}")
+            return ""
+    
+    def add_products(
+        self,
+        collection_name: str,
+        products: List[Dict[str, Any]],
+        text_embeddings: List[List[float]] = None,
+        image_embeddings: List[List[float]] = None
+    ) -> Tuple[int, int]:
+        """
+        Add products to the vector store with image data
+        
+        Args:
+            collection_name: Name of the collection
+            products: List of product dictionaries
+            text_embeddings: Optional list of text embeddings
+            image_embeddings: Optional list of image embeddings
+            
+        Returns:
+            Tuple of (success_count, failure_count)
+        """
+        if not products:
+            return 0, 0
+            
+        points = []
+        success = 0
+        
+        for i, product in enumerate(products):
+            try:
+                # Convert image to base64 if it's a file path
+                image_data = product.get('image_data', '')
+                if image_data and not image_data.startswith('data:image'):
+                    try:
+                        with open(image_data, 'rb') as f:
+                            image_data = self._image_to_base64(f.read())
+                    except Exception as e:
+                        logger.warning(f"Could not read image file {image_data}: {str(e)}")
+                        image_data = ''
+                
+                # Prepare vectors with validation
+                vectors = {}
+                
+                # Add text vector if available
+                text_vector = text_embeddings[i] if text_embeddings and i < len(text_embeddings) else None
+                if text_vector and len(text_vector) == 512:
+                    vectors['text'] = text_vector
+                else:
+                    logger.warning(f"Invalid text embedding for product {i}")
+                    continue
+                
+                # Add image vector if available
+                image_vector = image_embeddings[i] if image_embeddings and i < len(image_embeddings) else None
+                if image_vector and len(image_vector) == 512:
+                    vectors['image'] = image_vector
+                
+                point = {
+                    'id': product.get('id', str(uuid.uuid4())),
+                    'vector': vectors,
+                    'payload': {
+                        'product_id': product.get('product_id', ''),
+                        'name': product.get('name', ''),
+                        'description': product.get('description', ''),
+                        'price': str(product.get('price', '')),
+                        'category': product.get('category', '').lower(),
+                        'image_data': image_data,
+                        'metadata': product.get('metadata', {})
+                    }
+                }
+                points.append(point)
+                success += 1
+                
+            except Exception as e:
+                logger.error(f"Error processing product {i}: {str(e)}", exc_info=True)
+                continue
+        
+        if points:
+            try:
+                # Use our new upsert_points method which handles validation
+                if self.upsert_points(collection_name, points):
+                    logger.info(f"Successfully added {success} products to {collection_name}")
+                    return success, len(products) - success
+                
+            except Exception as e:
+                logger.error(f"Error adding products to Qdrant: {str(e)}")
+                return 0, len(products)
+                
+        return success, len(products) - success
 
     def create_collection_if_not_exists(self, name: str, vector_size: int = 512) -> bool:
         """Create collection if it doesn't exist
@@ -95,8 +343,8 @@ class VectorStore:
         try:
             collections = [c.name for c in self.client.get_collections().collections]
             if name not in collections:
-                self.create_collection(name, vector_size)
-                logger.info(f"Created new collection: {name} with vector size {vector_size}")
+                self.create_collection(name)
+                logger.info(f"Created new collection: {name}")
             return True
         except Exception as e:
             logger.error(f"Error creating collection {name}: {str(e)}")
@@ -191,6 +439,110 @@ class VectorStore:
             logger.error(f"Failed to delete collection {collection_name}: {str(e)}")
             return False
 
+    def search(
+        self,
+        collection_name: str,
+        query_vector: List[float],
+        vector_name: str = "text",
+        top_k: int = 5,
+        score_threshold: float = 0.0,
+        filter_categories: Optional[List[str]] = None,
+        with_vectors: bool = False,
+        with_payload: bool = True
+    ) -> List[Dict[str, Any]]:
+        """
+        Search for similar vectors in the specified collection.
+        
+        Args:
+            collection_name: Name of the collection to search in
+            query_vector: Query vector for similarity search
+            vector_name: Name of the vector to search ('text' or 'image')
+            top_k: Number of results to return
+            score_threshold: Minimum similarity score (0.0 to 1.0)
+            filter_categories: Optional list of categories to filter by
+            with_vectors: Whether to include vector in the response
+            with_payload: Whether to include payload in the response
+            
+        Returns:
+            List of search results with scores and payloads
+        """
+        try:
+            # Build the filter
+            query_filter = None
+            if filter_categories:
+                query_filter = models.Filter(
+                    must=[
+                        models.FieldCondition(
+                            key="category",
+                            match=models.MatchAny(any=[c.lower() for c in filter_categories])
+                        )
+                    ]
+                )
+            
+            # Perform the search
+            search_results = self.client.search(
+                collection_name=collection_name,
+                query_vector=(vector_name, query_vector),
+                query_filter=query_filter,
+                limit=top_k,
+                score_threshold=score_threshold,
+                with_vectors=with_vectors,
+                with_payload=with_payload
+            )
+            
+            # Convert to list of dicts for easier handling
+            results = []
+            for result in search_results:
+                result_dict = {
+                    'id': str(result.id),
+                    'score': float(result.score),
+                    'payload': result.payload or {}
+                }
+                
+                # Include vector if requested
+                if with_vectors and hasattr(result, 'vector'):
+                    result_dict['vector'] = result.vector
+                    
+                results.append(result_dict)
+            
+            return results
+            
+        except Exception as e:
+            error_msg = f"Error searching in collection {collection_name}"
+            logger.error(f"{error_msg}: {str(e)}")
+            raise Exception(f"{error_msg}: {str(e)}")
+            
+    def get_product_by_id(self, collection_name: str, product_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Retrieve a product by its ID
+        
+        Args:
+            collection_name: Name of the collection
+            product_id: ID of the product to retrieve
+            
+        Returns:
+            Product data if found, None otherwise
+        """
+        try:
+            result = self.client.retrieve(
+                collection_name=collection_name,
+                ids=[product_id],
+                with_vectors=False,
+                with_payload=True
+            )
+            
+            if not result:
+                return None
+                
+            return {
+                'id': str(result[0].id),
+                'payload': result[0].payload or {}
+            }
+            
+        except Exception as e:
+            logger.error(f"Error retrieving product {product_id}: {str(e)}")
+            return None
+
     def query_similar(
         self, 
         collection_name: str, 
@@ -268,6 +620,79 @@ class VectorStore:
             logger.error(f"Error in query_similar: {str(e)}", exc_info=True)
             return []
 
+    def search_by_filter(self, collection_name: str, filter_conditions: Dict, limit: int = 10) -> List[Dict]:
+        """
+        Search for points in the collection using filter conditions.
+        
+        Args:
+            collection_name: Name of the collection to search in
+            filter_conditions: Dictionary of field-value pairs to filter by
+            limit: Maximum number of results to return
+            
+        Returns:
+            List of matching points with payloads
+        """
+        try:
+            if not self.collection_exists(collection_name):
+                logger.warning(f"Collection {collection_name} does not exist")
+                return []
+                
+            must_conditions = []
+            
+            # Convert filter conditions to Qdrant filter conditions
+            if filter_conditions:
+                for field, value in filter_conditions.items():
+                    must_conditions.append(
+                        models.FieldCondition(
+                            key=field,
+                            match=models.MatchValue(value=value)
+                        )
+                    )
+            
+            # Create a filter with all conditions
+            filter_condition = models.Filter(must=must_conditions) if must_conditions else None
+            
+            # Create a dummy text vector for the search
+            dummy_text_vector = [0.0] * TEXT_EMBEDDING_DIM
+            
+            # Perform the search
+            search_results = self.client.scroll(
+                collection_name=collection_name,
+                scroll_filter=filter_condition,
+                limit=limit,
+                with_vectors=False,
+                with_payload=True
+            )
+            
+            # Process results
+            results = []
+            for hit in search_results[0]:  # scroll returns a tuple of (points, offset)
+                try:
+                    payload = dict(hit.payload or {})
+                    
+                    # Ensure all values in payload are JSON serializable
+                    for key, value in payload.items():
+                        if hasattr(value, 'isoformat'):  # Handle datetime
+                            payload[key] = value.isoformat()
+                        elif isinstance(value, (bytes, bytearray)):  # Handle binary data
+                            payload[key] = str(value)
+                    
+                    results.append({
+                        "id": str(hit.id) if hasattr(hit, 'id') else str(uuid.uuid4()),
+                        "score": float(hit.score) if hasattr(hit, 'score') else 0.0,
+                        "payload": payload
+                    })
+                    
+                except Exception as e:
+                    logger.error(f"Error processing search hit: {str(e)}", exc_info=True)
+                    continue
+            
+            return results
+            
+        except Exception as e:
+            logger.error(f"Error in search_by_filter: {str(e)}", exc_info=True)
+            return []
+
     def search(
         self, 
         collection_name: str, 
@@ -288,7 +713,7 @@ class VectorStore:
             top_k: Number of results to return
             score_threshold: Minimum similarity score (0.0 to 1.0)
             vector_name: Name of the vector to search in ("text" or "image")
-            filter_categories: List of categories to filter by
+            filter_conditions: Dictionary of field-value pairs to filter by
             query_text: Text query for exact matching
             exact_match: If True, perform exact text matching instead of vector search
             
@@ -308,15 +733,26 @@ class VectorStore:
                 logger.info(f"Applying filter conditions: {filter_conditions}")
                 conditions = []
                 
-                # Handle category filtering
-                if 'category' in filter_conditions:
-                    category = filter_conditions['category']
-                    conditions.append(
-                        models.FieldCondition(
-                            key="category",
-                            match=models.MatchText(text=category)
+                # Handle MongoDB-style operators like $in
+                for field, value in filter_conditions.items():
+                    if isinstance(value, dict):
+                        for op, op_value in value.items():
+                            if op == "$in" and isinstance(op_value, list):
+                                # Handle $in operator for category filtering
+                                conditions.append(
+                                    models.FieldCondition(
+                                        key=field,
+                                        match=models.MatchAny(any=op_value)
+                                    )
+                                )
+                    else:
+                        # Handle simple equality match
+                        conditions.append(
+                            models.FieldCondition(
+                                key=field,
+                                match=models.MatchValue(value=value)
+                            )
                         )
-                    )
                 
                 # Add more filter conditions as needed
                 # Example for price range:
@@ -413,4 +849,3 @@ class VectorStore:
             return []
 
 # Note: We don't initialize the vectorstore here anymore
-# It will be initialized in app.py with proper configuration
