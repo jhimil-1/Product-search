@@ -46,6 +46,7 @@ def generate_embedding(text):
 # Config
 # ---------------------------
 app = Flask(__name__, static_folder="frontend", static_url_path="")
+app.secret_key = os.getenv('FLASK_SECRET_KEY', 'dev-secret-key-123')  # Change this in production
 app.config['UPLOAD_FOLDER'] = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'uploads')
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif'}
@@ -108,6 +109,90 @@ def login_required(f):
         return f(*args, **kwargs)
     return decorated_function
 
+# Enhanced jewelry categorization
+def detect_jewelry_category(text):
+    """
+    Detect jewelry category from text with high accuracy.
+    Returns a list of matched categories in order of confidence.
+    """
+    if not text or not isinstance(text, str):
+        return []
+        
+    text_lower = text.lower().strip()
+    
+    # Define comprehensive jewelry categories with variations and synonyms
+    # Each pattern has a weight that affects the final confidence
+    category_patterns = {
+        'necklace': [
+            (r'\b(?:gold|silver|diamond|pearl|choker|pendant|chain)\s+(?:necklace|chain|pendant)\b', 1.0),
+            (r'\bnecklaces?\b', 0.9),
+            (r'\b(?:chokers?|pendants?|lockets?|collars?)\b', 0.85),
+            (r'\b(?:beads?|strand|layered|layering)\s+(?:necklace|chain)\b', 0.8),
+            (r'\b(?:y[oó]?u?k?i?|opera|rope|princess|matinee|bib|lariat|tassel|locket)\b', 0.7)
+        ],
+        'ring': [
+            (r'\b(?:engagement|wedding|diamond|gold|silver|platinum|band|stacking|cocktail|eternity|promise|signet|claddagh|solitare)\s+(?:ring|bands?)\b', 1.0),
+            (r'\brings?\b', 0.9),
+            (r'\b(?:bands?|anniversary|diamond|gemstone|birthstone|cluster|halo|three[\s-]?stone)\b', 0.8)
+        ],
+        'earring': [
+            (r'\b(?:stud|hoop|dangle|drop|huggy|threader|chandelier|ear\s*cuff|ear\s*jacket|ear\s*threader|ear\s*threaders|ear\s*threading|ear\s*threads)\s+(?:earrings?|ear\s*studs?|ear\s*hoops?|ear\s*drops?)\b', 1.0),
+            (r'\bearrings?\b', 0.9),
+            (r'\b(?:studs?|hoops?|dangles?|drops?|huggies?|threaders?|chandeliers?|ear\s*cuffs?|ear\s*jackets?)\b', 0.85)
+        ],
+        'bracelet': [
+            (r'\b(?:charm|bangle|cuff|tennis|chain|bead|leather|stainless\s*steel|gold|silver|diamond|gemstone)\s+(?:bracelets?|bangles?|cuffs?|bands?)\b', 1.0),
+            (r'\bbracelets?\b', 0.9),
+            (r'\b(?:bangles?|cuffs?|charms?|wristbands?|wrist\s*chains?|wristlets?|wrist\s*accessories?)\b', 0.8)
+        ],
+        'anklet': [
+            (r'\b(?:anklets?|ankle\s*chains?|ankle\s*bracelets?|foot\s*jewelry|toe\s*rings?)\b', 1.0)
+        ],
+        'brooch': [
+            (r'\b(?:brooches?|pins?|corsage|lapel\s*pins?|hat\s*pins?|tie\s*pins?|stick\s*pins?|enamel\s*pins?|vintage\s*brooches?)\b', 1.0)
+        ],
+        'watch': [
+            (r'\b(?:watches?|timepieces?|chronographs?|wristwatches?|smartwatches?|analog\s*watches?|digital\s*watches?|automatic\s*watches?|mechanical\s*watches?|quartz\s*watches?|diving\s*watches?|dress\s*watches?|sport\s*watches?|luxury\s*watches?|fashion\s*watches?|pocket\s*watches?)\b', 1.0)
+        ]
+    }
+    
+    # Score categories based on pattern matches
+    category_scores = {category: 0.0 for category in category_patterns}
+    
+    for category, patterns in category_patterns.items():
+        for pattern, weight in patterns:
+            if re.search(pattern, text_lower, re.IGNORECASE):
+                category_scores[category] = max(category_scores[category], weight)
+    
+    # Filter out categories with score below threshold and sort by score
+    threshold = 0.7
+    detected_categories = [
+        category for category, score in sorted(
+            category_scores.items(),
+            key=lambda x: x[1],
+            reverse=True
+        ) if score >= threshold
+    ]
+    
+    # If no strong matches found, try a more lenient approach
+    if not detected_categories:
+        for category, patterns in category_patterns.items():
+            if any(re.search(p[0], text_lower, re.IGNORECASE) for p in patterns):
+                detected_categories.append(category)
+    
+    # Remove duplicates while preserving order
+    seen = set()
+    return [x for x in detected_categories if not (x in seen or seen.add(x))]
+
+def extract_category_from_image_query(query_text=""):
+    """Extract category from image search context"""
+    if not query_text:
+        return []
+    
+    # Check for category mentions in the query
+    detected = detect_jewelry_category(query_text)
+    return detected
+
 # Add login route before other routes
 @app.route('/login', methods=['GET', 'POST'])
 def login():
@@ -121,25 +206,30 @@ def login():
     try:
         # Handle POST request
         data = request.get_json()
-        if not data or 'email' not in data or 'name' not in data:
-            return jsonify({'error': 'Email and name are required'}), 400
+        if not data or 'username' not in data or 'password' not in data:
+            return jsonify({'error': 'Username and password are required'}), 400
         
-        # Create user session
-        user = {
-            'email': data['email'],
-            'name': data['name']
-        }
-        
-        # Store user in session
-        session['user'] = user
-        session.permanent = True  # Make the session persistent
-        
-        return jsonify({
-            'message': 'Login successful',
-            'user': user,
-            'redirect': '/'  # Add redirect URL
-        })
-        
+        # In a real application, you would validate the username and password here
+        # For now, we'll just create a session for any valid credentials
+        if data['username'] and data['password']:
+            # Create user session
+            user = {
+                'username': data['username'],
+                'name': data['username'].split('@')[0].capitalize()
+            }
+            
+            # Store user in session
+            session['user'] = user
+            session.permanent = True  # Make the session persistent
+            
+            return jsonify({
+                'message': 'Login successful',
+                'user': user,
+                'redirect': '/'  # Add redirect URL
+            })
+        else:
+            return jsonify({'error': 'Invalid credentials'}), 401
+            
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -159,9 +249,20 @@ def serve_index():
 # Serve static files from the frontend directory
 @app.route('/<path:path>')
 def serve_static(path):
-    if 'user' not in session and path != 'login.html':
+    # Allow access to login page and static files without authentication
+    if 'user' not in session and path != 'login.html' and not path.startswith(('js/', 'static/')):
         return redirect(url_for('login'))
     return send_from_directory('frontend', path)
+
+# Serve JavaScript files
+@app.route('/js/<path:filename>')
+def serve_js(filename):
+    return send_from_directory(os.path.join('frontend', 'js'), filename)
+
+# Serve CSS files
+@app.route('/static/css/<path:filename>')
+def serve_css(filename):
+    return send_from_directory(os.path.join('frontend', 'static', 'css'), filename)
 
 @app.route("/uploads/<filename>")
 def serve_uploaded_file(filename):
@@ -405,16 +506,27 @@ def upload_products(session_id):
                         logger.warning(f"Failed to download image from {image_url}: {str(e)}")
                         image_url = ''  # Clear the URL if download fails
                 
-                # Generate text embedding from product name, category, and description
-                category = str(product.get('category', '')).lower()
-                text_to_embed = f"{name} {category} {description}".strip()
+                # Enhanced category detection and normalization
+                category_raw = str(product.get('category', '')).strip().lower()
+                detected_categories = detect_jewelry_category(f"{name} {description} {category_raw}")
                 
-                # Add product type to the text if it can be inferred
-                product_types = ["ring", "necklace", "bracelet", "earring", "watch"]
-                for ptype in product_types:
-                    if ptype in name.lower() or ptype in description.lower() or ptype in category:
-                        text_to_embed = f"{ptype} {text_to_embed}"  # Emphasize product type
-                        break
+                # Use detected categories or fallback to raw category
+                if detected_categories:
+                    # Join multiple categories with comma for storage
+                    category = ', '.join(detected_categories)
+                else:
+                    # If no category detected, use the raw category or default to 'jewelry'
+                    category = category_raw if category_raw else 'jewelry'
+                
+                # Ensure category is properly formatted for indexing
+                category = ' '.join(word.strip() for word in category.split() if word.strip())
+                
+                # Generate text embedding with category emphasis
+                text_to_embed = f"{category} {name} {description}".strip()
+                
+                # Add product type emphasis based on detected category
+                if category in ['necklace', 'ring', 'bracelet', 'earring', 'anklet', 'watch']:
+                    text_to_embed = f"{category} jewelry {text_to_embed}"
                 
                 if not text_to_embed:
                     logger.warning(f"Skipping product with empty data: {product_id}")
@@ -460,14 +572,15 @@ def upload_products(session_id):
                             'product_id': product_id,
                             'name': name,
                             'description': description,
-                            'category': category,
+                            'category': category,  # Store normalized category
+                            'original_category': category_raw,  # Store original category for reference
                             'price': str(product.get('price', 'N/A')),
                             'image_url': image_url,
                             'image_data': image_data if image_data else ''
                         },
                         'vector': vector_dict
                     })
-                    logger.info(f"Added product {product_id} with valid embeddings")
+                    logger.info(f"Added product {product_id} with normalized category '{category}' and valid embeddings")
                 else:
                     logger.warning(f"Skipping product {product_id} due to invalid text embedding")
                 
@@ -553,157 +666,179 @@ def query_text():
         return jsonify({"error": "An error occurred while processing your request"}), 500
 
 def handle_product_search(query: str, session_id: str, collection_name: str):
-    """Handle product search by text query with exact matching and category filtering"""
+    """Enhanced product search with strict category filtering"""
     try:
         # Verify session exists
         session_data = sessions_col.find_one({"_id": session_id})
         if not session_data or 'collection_name' not in session_data:
             return jsonify({"error": "Session not found"}), 404
         
-        # Define jewelry categories and their variations
-        jewelry_categories = {
-            'necklace': ['necklace', 'necklaces'],
-            'ring': ['ring', 'rings'],
-            'bracelet': ['bracelet', 'bracelets'],
-            'earring': ['earring', 'earrings'],
-            'anklet': ['anklet', 'anklets'],
-            'pendant': ['pendant', 'pendants'],
-            'bangle': ['bangle', 'bangles'],
-            'brooch': ['brooch', 'brooches'],
-            'choker': ['choker', 'chokers']
-        }
+        # Detect categories from the query
+        detected_categories = detect_jewelry_category(query)
         
-        # Check if query contains any jewelry category
-        query_lower = query.lower()
-        matched_categories = []
+        logger.info(f"Search query: '{query}' - Detected categories: {detected_categories}")
         
-        # Find all matching categories in the query
-        for category, terms in jewelry_categories.items():
-            if any(re.search(r'\b' + re.escape(term) + r'\b', query_lower) for term in terms):
-                matched_categories.append(category)
+        # Create enhanced query for embedding
+        if detected_categories:
+            # Boost the category in the query
+            enhanced_query = f"{' '.join(detected_categories)} {query}"
+        else:
+            enhanced_query = query
         
-        # If we're looking for a specific category, search within that category
-        if matched_categories:
-            # Create a query that emphasizes the category
-            boosted_query = " ".join([f"{c}" for c in matched_categories])
-            query_embedding = embed_text(boosted_query)
-            
-            # First try with strict category matching
-            results = vector_store.search(
+        # Generate embedding for the search query
+        query_embedding = embed_text(enhanced_query)
+        if not query_embedding:
+            return jsonify({"error": "Failed to process search query"}), 500
+        
+        # Always use category filtering if categories were detected
+        if detected_categories:
+            logger.info(f"Searching with category filter: {detected_categories}")
+            results = vector_store.search_with_category_filter(
                 collection_name=collection_name,
                 query_vector=query_embedding,
-                filter_categories=matched_categories,
+                categories=detected_categories,
                 top_k=10,
-                score_threshold=0.7  # Higher threshold for strict matching
+                score_threshold=0.5  # Slightly lower threshold to get more results for filtering
             )
             
-            # If no results with strict matching, try with a lower threshold
+            # If no results with category filter, try a broader search but still within the category
             if not results:
+                logger.info("No results with category filter, trying broader search within category")
                 results = vector_store.search(
                     collection_name=collection_name,
                     query_vector=query_embedding,
-                    filter_categories=matched_categories,
-                    top_k=10,
-                    score_threshold=0.4
+                    top_k=20,
+                    score_threshold=0.3
                 )
-            
-            # Filter results to ensure they match at least one of the categories
-            if results:
-                filtered_results = []
-                for result in results:
-                    payload = getattr(result, 'payload', {}) or {}
-                    result_categories = str(payload.get('category', '')).lower().split(',')
-                    # Check if any of the matched categories are in the result categories
-                    if any(cat.strip() in ' '.join(result_categories) for cat in matched_categories):
-                        filtered_results.append(result)
                 
-                if filtered_results:
-                    return format_product_results(filtered_results[:10], session_id)  # Return top 10 filtered results
-        
-        # If no category match or no results from category search, try exact match
-        exact_matches = vector_store.search(
-            collection_name=collection_name,
-            query_text=query,
-            exact_match=True,
-            top_k=1
-        )
-        
-        # If we found an exact match, return only that product
-        if exact_matches and hasattr(exact_matches[0], 'score') and exact_matches[0].score > 0.9:
-            return format_product_results([exact_matches[0]], session_id)
-            
-        # If no exact match, proceed with regular semantic search
-        if 'query_embedding' not in locals():
-            query_embedding = embed_text(query)
-            if not query_embedding:
-                return jsonify({"error": "Failed to process search query"}), 500
-            
+                # Filter results to only include matching categories
+                if results:
+                    filtered_results = []
+                    for result in results:
+                        payload = getattr(result, 'payload', {}) or {}
+                        result_category = str(payload.get('category', '')).lower()
+                        
+                        # Check if result category matches any detected category
+                        if any(cat in result_category or result_category in cat 
+                             for cat in detected_categories):
+                            filtered_results.append(result)
+                            if len(filtered_results) >= 10:  # Limit to top 10
+                                break
+                    
+                    results = filtered_results
+        else:
+            # No specific categories detected, use regular search with higher threshold
+            logger.info("No specific category detected, using regular search")
             results = vector_store.search(
                 collection_name=collection_name,
                 query_vector=query_embedding,
-                top_k=5,
-                score_threshold=0.5
+                top_k=10,
+                score_threshold=0.6  # Higher threshold for non-category searches
             )
         
-        # If we have results, return them
+        # Format and return results
         if results:
-            return format_product_results(results, session_id)
+            formatted_results = format_product_results(results, session_id)
+            logger.info(f"Returning {len(formatted_results)} results for query: '{query}'")
+            return jsonify({"results": formatted_results})
+        else:
+            logger.info(f"No results found for query: '{query}'")
+            return jsonify({"message": "No matching products found", "results": []})
             
-        return jsonify({"message": "No matching products found"}), 404
-        
     except Exception as e:
         logger.error(f"Error in handle_product_search: {str(e)}", exc_info=True)
-        return jsonify({"error": "An error occurred while searching for products"}), 500
+        return jsonify({"error": "An error occurred while processing your request"}), 500
 
 def handle_product_question(question: str, session_id: str, collection_name: str):
-    """Handle questions about products"""
+    """Handle questions about products with category awareness"""
     try:
         # Verify session exists
         session_data = sessions_col.find_one({"_id": session_id})
         if not session_data or 'collection_name' not in session_data:
-            return jsonify({"error": "Session not found"}), 404
+            return {"error": "Session not found or invalid"}, 404
+            
+        # Get collection name from session if not provided
+        if not collection_name:
+            collection_name = session_data.get('collection_name')
+            if not collection_name:
+                return {"error": "No collection associated with this session"}, 400
         
-        # Generate embedding for the question
+        # Process the question
+        question_lower = question.lower()
+        
+        # Check for common questions
+        if any(q in question_lower for q in ["how many products", "total products", "number of products"]):
+            # Count total products in the collection
+            count = vector_store.count_points(collection_name=collection_name)
+            return {"message": f"There are {count} products in the catalog."}
+        
+        # Detect categories from the question for more specific searches
+        detected_categories = detect_jewelry_category(question)
+        
+        # Generate embedding for semantic search if needed
         question_embedding = embed_text(question)
         if not question_embedding:
-            return jsonify({"error": "Failed to process your question"}), 500
+            return {"error": "Failed to process your question"}, 500
             
-        # Search for relevant products
+        # Search for relevant products with category filtering if applicable
+        if detected_categories:
+            results = vector_store.search_with_category_filter(
+                collection_name=collection_name,
+                query_vector=question_embedding,
+                categories=detected_categories,
+                top_k=5,
+                score_threshold=0.4
+            )
+            
+            if results:
+                formatted_results = format_product_results(results, session_id)
+                return {
+                    "message": f"Here are some {', '.join(detected_categories)} that might match your question:",
+                    "results": formatted_results,
+                    "detected_categories": detected_categories
+                }
+        
+        # If no results with category filter, try a general search
         results = vector_store.search(
             collection_name=collection_name,
             query_vector=question_embedding,
-            top_k=3,
+            top_k=5,
             score_threshold=0.4
         )
         
-        if not results:
-            return jsonify({
-                "message": "I couldn't find any relevant products to answer your question.",
-                "results": []
-            })
-            
-        # Format the results
-        formatted_results = format_product_results(results, session_id)
+        if results:
+            formatted_results = format_product_results(results, session_id)
+            if formatted_results and len(formatted_results) > 0:
+                top_result = formatted_results[0]
+                answer = top_result.get('name', 'I found some products')
+                if top_result.get('description'):
+                    answer += f" - {top_result['description'][:100]}..."
+                
+                return {
+                    "message": answer,
+                    "results": formatted_results,
+                    "detected_categories": detected_categories or []
+                }
         
-        # For now, just return the top result as the answer
-        if formatted_results and len(formatted_results) > 0:
-            top_result = formatted_results[0]
-            answer = f"I found a product that might help: {top_result['name']}"
-            if top_result.get('description'):
-                answer += f" - {top_result['description'][:100]}..."
-            return jsonify({
-                "message": answer,
-                "results": formatted_results
-            })
-            
-        return jsonify({"results": formatted_results})
+        # Default response if no products found
+        return {
+            "message": "I couldn't find any products matching your question. " \
+                      "Please try asking about specific products or categories.",
+            "results": [],
+            "detected_categories": detected_categories or []
+        }
         
     except Exception as e:
-        logger.error(f"Error in handle_product_question: {str(e)}", exc_info=True)
-        return jsonify({"error": "An error occurred while processing your question"}), 500
+        logger.error(f"Error handling product question: {str(e)}", exc_info=True)
+        return {
+            "error": "An error occurred while processing your question",
+            "results": []
+        }, 500
 
 def format_product_results(results, session_id):
-    """Format product results for the frontend with proper image URLs from Qdrant"""
+    """
+    Format product results for the frontend with proper image URLs from Qdrant
+    """
     if not results:
         return []
         
@@ -793,9 +928,6 @@ def format_product_results(results, session_id):
     
     return formatted_results
 
-# ---------------------------
-# Image query
-# ---------------------------
 @app.route("/query_image/<session_id>", methods=["POST"])
 @login_required
 def query_image(session_id):
@@ -819,36 +951,133 @@ def query_image(session_id):
             
         collection_name = session_data['collection_name']
         
+        # Enhanced category detection from multiple sources
+        filename = file.filename or ""
+        user_context = request.form.get('context', '')
+        query_text = request.form.get('query', '')  # Additional query text if provided
+        
+        # Combine all available context for category detection
+        all_context = f"{filename} {user_context} {query_text}"
+        detected_categories = extract_category_from_image_query(all_context)
+        
+        # Also try to detect from common image naming patterns
+        if not detected_categories:
+            # Check for common patterns in filenames
+            filename_lower = filename.lower()
+            if any(word in filename_lower for word in ['necklace', 'chain', 'pendant']):
+                detected_categories = ['necklace']
+            elif any(word in filename_lower for word in ['ring', 'band', 'engagement']):
+                detected_categories = ['ring']
+            elif any(word in filename_lower for word in ['bracelet', 'bangle']):
+                detected_categories = ['bracelet']
+            elif any(word in filename_lower for word in ['earring', 'stud', 'hoop']):
+                detected_categories = ['earring']
+        
+        logger.info(f"Image search context: filename='{filename}', user_context='{user_context}', detected_categories={detected_categories}")
+        
         # Generate embedding for the image
         try:
-            # Convert image to base64 for storage
-            image_base64 = base64.b64encode(image_data).decode('utf-8')
-            
             # Generate image embedding
             image_embedding = embed_image_bytes(image_data)
             
             if image_embedding is None or len(image_embedding) != 512:
                 raise ValueError("Failed to generate valid image embedding")
+            
+            # Multi-stage search approach for better results
+            results = None
+            
+            # Stage 1: Always try category-filtered search first if we detected categories
+            results = None
+            if detected_categories:
+                try:
+                    logger.info(f"Stage 1: Strict category filtering for: {detected_categories}")
+                    results = vector_store.search_with_category_filter(
+                        collection_name=collection_name,
+                        query_vector=image_embedding,
+                        vector_name="image",
+                        categories=detected_categories,
+                        top_k=10,
+                        score_threshold=0.4  # Slightly lower threshold to ensure we get results
+                    )
+                    
+                    if results:
+                        logger.info(f"Found {len(results)} results with strict category filter")
+                    else:
+                        logger.info("No results with strict category filter")
                 
-            # Search for visually similar products
-            results = vector_store.search(
-                collection_name=collection_name,
-                query_vector=image_embedding,
-                vector_name="image",
-                top_k=3,
-                score_threshold=0.3
-            )
+                except Exception as e:
+                    logger.warning(f"Category filter search failed: {str(e)}")
+                    results = None
+            
+            # Stage 2: Broader image search without strict category filtering
+            if not results:
+                logger.info("Stage 2: Broader image search without category filter")
+                results = vector_store.search(
+                    collection_name=collection_name,
+                    query_vector=image_embedding,
+                    vector_name="image",
+                    top_k=15,
+                    score_threshold=0.1  # Even lower threshold for broader search
+                )
+            
+            # Stage 3: Strict category filtering for image search results
+            if results and detected_categories:
+                logger.info(f"Stage 3: Strict category filtering for: {detected_categories}")
+                
+                filtered_results = []
+                
+                for result in results:
+                    payload = getattr(result, 'payload', {}) or {}
+                    result_category = str(payload.get('category', '')).lower().strip()
+                    
+                    # Check if result category matches any detected category
+                    is_category_match = any(
+                        detected_cat.lower() == result_category or 
+                        detected_cat.lower() in result_category or 
+                        result_category in detected_cat.lower()
+                        for detected_cat in detected_categories
+                    )
+                    
+                    if is_category_match:
+                        filtered_results.append(result)
+                
+                # Only return results that match the detected categories
+                if filtered_results:
+                    results = filtered_results[:6]  # Limit to top 6 category matches
+                    logger.info(f"Found {len(filtered_results)} results matching categories: {detected_categories}")
+                else:
+                    # If no category matches, indicate this in the response
+                    logger.info(f"No results found matching categories: {detected_categories}")
+                    return jsonify({
+                        "message": f"No products found matching categories: {', '.join(detected_categories)}. Try a different image or search term.",
+                        "results": []
+                    })
+            else:
+                # No category filtering, just take top results
+                results = results[:6] if results else []
             
             if not results:
-                return jsonify({"error": "No visually similar products found"}), 404
+                return jsonify({
+                    "message": "No visually similar products found. Try uploading a clearer image or search by text.",
+                    "results": []
+                })
                 
             # Format the results for the response
             formatted_results = format_product_results(results, session_id)
             
-            # Return the visually similar products
+            # Create response message based on detected categories
+            if detected_categories:
+                category_text = ', '.join(detected_categories)
+                message = f"Here are some visually similar {category_text}s:"
+            else:
+                message = "Here are some visually similar products:"
+                
+            logger.info(f"Returning {len(formatted_results)} formatted results")
+            
             return jsonify({
-                "message": "Here are some visually similar products:",
-                "results": formatted_results
+                "message": message,
+                "results": formatted_results,
+                "detected_categories": detected_categories  # Include this for debugging
             })
             
         except Exception as e:

@@ -3,6 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <title>AI E-commerce Chatbot</title>
+  <link rel="stylesheet" href="/static/css/styles.css">
   <style>
     body { font-family: Arial, sans-serif; margin: 20px; max-width: 800px; margin: 0 auto; }
     .step { 
@@ -10,6 +11,106 @@
       padding: 15px; 
       margin-bottom: 20px;
       border-radius: 5px;
+    }
+    
+    /* Drop area styles */
+    #drop-area {
+      border: 2px dashed #ccc;
+      border-radius: 8px;
+      padding: 30px;
+      text-align: center;
+      margin: 20px 0;
+      transition: all 0.3s;
+    }
+    
+    #drop-area.highlight {
+      background-color: #f0f8ff;
+      border-color: #4CAF50;
+    }
+    
+    /* Loading spinner */
+    .spinner {
+      border: 4px solid rgba(0, 0, 0, 0.1);
+      width: 36px;
+      height: 36px;
+      border-radius: 50%;
+      border-left-color: #09f;
+      animation: spin 1s linear infinite;
+      margin: 0 auto 10px;
+    }
+    
+    @keyframes spin {
+      0% { transform: rotate(0deg); }
+      100% { transform: rotate(360deg); }
+    }
+    
+    /* Products grid */
+    .products-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+      gap: 20px;
+      margin-top: 20px;
+    }
+    
+    .product-card {
+      border: 1px solid #ddd;
+      border-radius: 8px;
+      overflow: hidden;
+      transition: transform 0.2s;
+    }
+    
+    .product-card:hover {
+      transform: translateY(-5px);
+      box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+    }
+    
+    .product-image {
+      width: 100%;
+      height: 200px;
+      object-fit: cover;
+    }
+    
+    .no-image-placeholder {
+      width: 100%;
+      height: 200px;
+      background-color: #f5f5f5;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: #999;
+    }
+    
+    .product-info {
+      padding: 15px;
+    }
+    
+    .product-name {
+      margin: 0 0 10px 0;
+      font-size: 16px;
+    }
+    
+    .product-price {
+      font-size: 18px;
+      color: #e44d26;
+      margin: 0 0 10px 0;
+    }
+    
+    .product-description {
+      font-size: 14px;
+      color: #666;
+      margin: 0 0 10px 0;
+    }
+    
+    .product-meta {
+      display: flex;
+      justify-content: space-between;
+      font-size: 12px;
+      color: #888;
+    }
+    
+    .loading-message, .error-message {
+      text-align: center;
+      padding: 30px;
     }
     .step-header { 
       font-weight: bold; 
@@ -155,6 +256,12 @@
       color: #666;
     }
   </style>
+  <script src="/js/main.js"></script>
+  <script>
+    // Global variables
+    let sessionId = "";
+    let currentStep = 1;
+  </script>
 </head>
 <body>
   <div class="user-info" id="userInfo" style="display: none;">
@@ -212,24 +319,29 @@
     <div class="step-header">
       <div><span class="step-number">3</span> Search & Ask Questions</div>
     </div>
-    <div class="step-content">
-      <div id="chat"></div>
-      <div>
-        <input type="file" id="imageQuery" accept="image/*" style="display: none;">
+    <div class="step">
+      <div class="step-header">Step 3: Upload Image</div>
+      <div id="drop-area">
+        <p>Drag & drop an image here, or click to select</p>
+        <input type="file" id="imageUpload" accept="image/*" style="display: none;">
+        <div id="imagePreview"></div>
+      </div>
+      <div id="results-container"></div>
+    </div>
+    <div id="chat"></div>
+    <div style="margin-top: 20px;">
+      <div style="display: flex; align-items: center; margin-bottom: 10px;">
         <button id="browseImage">Upload Image to Search</button>
-        <span id="selectedImage">No image selected</span>
+        <input type="file" id="imageQuery" accept="image/*" style="display: none;">
+        <span id="selectedImage" style="margin-left: 10px;">No image selected</span>
       </div>
-      <div style="display: flex; margin-top: 10px;">
-        <input type="text" id="textQuery" placeholder="Ask a question about the products..." style="flex-grow: 1;">
-        <button id="sendQuery">Send</button>
-      </div>
+    <div style="display: flex; margin-top: 10px;">
+      <input type="text" id="textQuery" placeholder="Ask a question about the products..." style="flex-grow: 1;">
+      <button id="sendQuery">Send</button>
     </div>
   </div>
 
   <script>
-    let sessionId = "";
-    let currentStep = 1;
-
     // Initialize steps
     function updateSteps() {
       document.querySelectorAll('.step').forEach((step, index) => {
@@ -497,154 +609,168 @@
     };
 
     // Step 3: Image Upload
-    document.getElementById("browseImage").onclick = () => {
-      document.getElementById("imageQuery").click();
-    };
-
-    document.getElementById("imageQuery").onchange = (e) => {
-      const file = e.target.files[0];
-      if (file) {
-        document.getElementById("selectedImage").textContent = file.name;
-      }
-    };
+    const browseBtn = document.getElementById("browseImage");
+    const imageInput = document.getElementById("imageQuery");
+    const selectedImageSpan = document.getElementById("selectedImage");
+    
+    if (browseBtn && imageInput) {
+      browseBtn.onclick = () => imageInput.click();
+      
+      imageInput.onchange = (e) => {
+        const file = e.target.files[0];
+        if (file && selectedImageSpan) {
+          selectedImageSpan.textContent = file.name;
+        }
+      };
+    }
 
     // Handle text queries
-    document.getElementById("sendQuery").onclick = async () => {
-      const query = document.getElementById("textQuery").value.trim();
-      const fileInput = document.getElementById("imageQuery");
-      const file = fileInput.files[0];
-      
-      if (!query && !file) {
-        addMessage("bot", "Please enter a question or upload an image to search.");
-        return;
-      }
-      
-      // Priority: If both text and image are provided, use image search only
-      if (file) {
-        addMessage("user", query ? `${query} [Image: ${file.name}]` : `[Image: ${file.name}]`);
+    const sendQueryBtn = document.getElementById("sendQuery");
+    const textQueryInput = document.getElementById("textQuery");
+    const fileInput = document.getElementById("imageQuery");
+    
+    if (sendQueryBtn && textQueryInput && fileInput) {
+      sendQueryBtn.onclick = async () => {
+        const query = textQueryInput.value.trim();
+        const file = fileInput.files[0];
         
-        const formData = new FormData();
-        formData.append("file", file);
+        if (!query && !file) {
+          addMessage("bot", "Please enter a question or upload an image to search.");
+          return;
+        }
         
-        try {
-          const response = await fetch(`/query_image/${sessionId}`, {
-            method: "POST",
-            body: formData
-          });
+        // Priority: If both text and image are provided, use image search only
+        if (file) {
+          addMessage("user", query ? `${query} [Image: ${file.name}]` : `[Image: ${file.name}]`);
           
-          let data;
+          const formData = new FormData();
+          formData.append("file", file);
+          
           try {
-            data = await response.json();
-          } catch (parseError) {
-            throw new Error("Server returned invalid response format. Please check your connection.");
-          }
-          
-          if (response.ok) {
-            // Display the message from the server
-            if (data.message) {
-              addMessage("bot", data.message);
+            const response = await fetch(`/query_image/${sessionId}`, {
+              method: "POST",
+              body: formData
+            });
+            
+            let data;
+            try {
+              data = await response.json();
+            } catch (parseError) {
+              throw new Error("Server returned invalid response format. Please check your connection.");
             }
             
-            // Display results if available
-            if (data.results && Array.isArray(data.results) && data.results.length > 0) {
-              data.results.forEach(product => {
-                const scoreText = product.score ? `${Math.round(product.score)}` : '';
-                addMessage("bot", {
-                  name: product.name || 'Unnamed Product',
-                  price: product.price || '',
-                  category: product.category || '',
-                  description: product.description || '',
-                  image_url: product.image_url || '',
-                  score: scoreText
-                }, true);
-              });
-            } else if (!data.message) {
-              addMessage("bot", "No similar products found.");
+            if (response.ok) {
+              // Display the message from the server
+              if (data.message) {
+                addMessage("bot", data.message);
+              }
+              
+              // Display results if available
+              if (data.results && Array.isArray(data.results) && data.results.length > 0) {
+                data.results.forEach(product => {
+                  const scoreText = product.score ? `${Math.round(product.score)}` : '';
+                  addMessage("bot", {
+                    name: product.name || 'Unnamed Product',
+                    price: product.price || '',
+                    category: product.category || '',
+                    description: product.description || '',
+                    image_url: product.image_url || '',
+                    score: scoreText
+                  }, true);
+                });
+              } else if (!data.message) {
+                addMessage("bot", "No similar products found.");
+              }
+            } else {
+              addMessage(`Error: ${data.error || 'Failed to process image'}`, 'error');
             }
-          } else {
-            addMessage(`Error: ${data.error || 'Failed to process image'}`, 'error');
+          } catch (error) {
+            console.error('Error searching by image:', error);
+            if (error.message && error.message.includes("Unexpected token")) {
+              addMessage("bot", "Error: Server returned invalid response. Please check your connection and try again.");
+            } else {
+              addMessage('An error occurred while searching for similar products. Please try again.', 'error');
+            }
           }
-        } catch (error) {
-          console.error('Error searching by image:', error);
-          if (error.message && error.message.includes("Unexpected token")) {
-            addMessage("bot", "Error: Server returned invalid response. Please check your connection and try again.");
-          } else {
-            addMessage('An error occurred while searching for similar products. Please try again.', 'error');
-          }
-        }
-        
-        // Clear the file input
-        fileInput.value = "";
-        document.getElementById("selectedImage").textContent = "No image selected";
-        
-        // Clear text query if it was used with image
-        if (query) {
-          document.getElementById("textQuery").value = "";
-        }
-      } else if (query) {
-        // Text-only search
-        addMessage("user", query);
-        document.getElementById("textQuery").value = "";
-        
-        try {
-          const response = await fetch(`/query`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ 
-              query, 
-              session_id: sessionId 
-            })
-          });
           
-          let data;
+          // Clear the file input
+          fileInput.value = "";
+          const selectedImageSpan = document.getElementById("selectedImage");
+          if (selectedImageSpan) {
+            selectedImageSpan.textContent = "No image selected";
+          }
+          
+          // Clear text query if it was used with image
+          if (query) {
+            textQueryInput.value = "";
+          }
+        } else if (query) {
+          // Text-only search
+          addMessage("user", query);
+          textQueryInput.value = "";
+          
           try {
-            data = await response.json();
-          } catch (parseError) {
-            throw new Error("Server returned invalid response format. Please check your connection.");
-          }
-          
-          if (response.ok) {
-            // Display the message from the server
-            if (data.message) {
-              addMessage("bot", data.message);
+            const response = await fetch(`/query`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ 
+                query, 
+                session_id: sessionId 
+              })
+            });
+            
+            let data;
+            try {
+              data = await response.json();
+            } catch (parseError) {
+              throw new Error("Server returned invalid response format. Please check your connection.");
             }
             
-            // Display results if available
-            if (data.results && Array.isArray(data.results) && data.results.length > 0) {
-              data.results.forEach(product => {
-                const scoreText = product.score ? `${Math.round(product.score)}` : '';
-                addMessage("bot", {
-                  name: product.name || 'Unnamed Product',
-                  price: product.price || '',
-                  category: product.category || '',
-                  description: product.description || '',
-                  image_url: product.image_url || '',
-                  score: scoreText
-                }, true);
-              });
-            } else if (!data.message) {
-              addMessage("bot", "No matching products found.");
+            if (response.ok) {
+              // Display the message from the server
+              if (data.message) {
+                addMessage("bot", data.message);
+              }
+              
+              // Display results if available
+              if (data.results && Array.isArray(data.results) && data.results.length > 0) {
+                data.results.forEach(product => {
+                  const scoreText = product.score ? `${Math.round(product.score)}` : '';
+                  addMessage("bot", {
+                    name: product.name || 'Unnamed Product',
+                    price: product.price || '',
+                    category: product.category || '',
+                    description: product.description || '',
+                    image_url: product.image_url || '',
+                    score: scoreText
+                  }, true);
+                });
+              } else if (!data.message) {
+                addMessage("bot", "No matching products found.");
+              }
+            } else {
+              throw new Error(data.error || "Failed to process your query");
             }
-          } else {
-            throw new Error(data.error || "Failed to process your query");
-          }
-        } catch (error) {
-          console.error("Error processing query:", error);
-          if (error.message && error.message.includes("Unexpected token")) {
-            addMessage("bot", "Error: Server returned invalid response. Please check your connection and try again.");
-          } else {
-            addMessage("bot", "Error: " + (error.message || "Failed to process your query"));
+          } catch (error) {
+            console.error("Error processing query:", error);
+            if (error.message && error.message.includes("Unexpected token")) {
+              addMessage("bot", "Error: Server returned invalid response. Please check your connection and try again.");
+            } else {
+              addMessage("bot", "Error: " + (error.message || "Failed to process your query"));
+            }
           }
         }
-      }
-    };
+      };
+    }
 
     // Allow pressing Enter in the query input
-    document.getElementById("textQuery").addEventListener("keypress", (e) => {
-      if (e.key === "Enter") {
-        document.getElementById("sendQuery").click();
-      }
-    });
+    if (textQueryInput && sendQueryBtn) {
+      textQueryInput.addEventListener("keypress", (e) => {
+        if (e.key === "Enter") {
+          sendQueryBtn.click();
+        }
+      });
+    }
 
     // Check authentication status when page loads
     document.addEventListener('DOMContentLoaded', async () => {

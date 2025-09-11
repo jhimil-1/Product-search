@@ -73,32 +73,39 @@ class VectorStore:
         try:
             # Check if collection exists
             collections = self.client.get_collections()
-            collection_exists = any(collection.name == collection_name for collection in collections.collections)
             
-            # Delete existing collection if recreate is True or if it exists
-            if recreate or collection_exists:
-                try:
-                    self.client.delete_collection(collection_name)
-                    logger.info(f"Deleted existing collection: {collection_name}")
-                except Exception as e:
-                    if "not found" not in str(e).lower():
-                        logger.warning(f"Error deleting collection {collection_name}: {str(e)}")
-            
-            # Create new collection with both text and image vectors
+            # Define the collection configuration with both vectors
             self.client.create_collection(
                 collection_name=collection_name,
                 vectors_config={
                     "text": models.VectorParams(
-                        size=TEXT_EMBEDDING_DIM,  # SentenceTransformer uses 384-dimensional vectors
+                        size=TEXT_EMBEDDING_DIM,
                         distance=models.Distance.COSINE
                     ),
                     "image": models.VectorParams(
-                        size=IMAGE_EMBEDDING_DIM,  # CLIP uses 512-dimensional vectors
+                        size=IMAGE_EMBEDDING_DIM,
                         distance=models.Distance.COSINE
                     )
                 }
             )
-            logger.info(f"Created new collection: {collection_name} with text vectors of size {TEXT_EMBEDDING_DIM} and image vectors of size {IMAGE_EMBEDDING_DIM}")
+            logger.info(f"Created collection '{collection_name}' with text and image vectors")
+            
+            # Create payload index for category field
+            try:
+                self.client.create_payload_index(
+                    collection_name=collection_name,
+                    field_name="category",
+                    field_schema=models.TextIndexParams(
+                        type="text",
+                        tokenizer=models.TokenizerType.WORD,
+                        min_token_len=2,
+                        max_token_len=20,
+                        lowercase=True
+                    )
+                )
+                logger.info(f"Created text index for 'category' field in collection '{collection_name}'")
+            except Exception as e:
+                logger.warning(f"Could not create category index (may already exist): {str(e)}")
             
             # Create payload indexes for faster filtering
             try:
@@ -848,4 +855,128 @@ class VectorStore:
             logger.error(f"Error in search: {str(e)}", exc_info=True)
             return []
 
-# Note: We don't initialize the vectorstore here anymore
+    def search_with_category_filter(self, collection_name, query_vector, categories, vector_name="text", top_k=5, score_threshold=0.5):
+        """
+        Search for similar vectors with strict category filtering
+        
+        Args:
+            collection_name: Name of the collection to search
+            query_vector: Query vector for similarity search
+            categories: List of categories to filter by (case-insensitive)
+            vector_name: Name of the vector to search ("text" or "image")
+            top_k: Number of results to return
+            score_threshold: Minimum similarity score threshold
+        
+        Returns:
+            List of search results matching the category filter
+        """
+        try:
+            from qdrant_client import models
+            
+            if not categories:
+                logger.warning("No categories provided for category filter")
+                return []
+                
+            # Normalize categories to lowercase for consistent matching
+            categories = [str(cat).lower().strip() for cat in categories if cat and str(cat).strip()]
+            if not categories:
+                logger.warning("No valid categories provided after normalization")
+                return []
+                
+            logger.info(f"Searching with strict category filter for: {categories}")
+            
+            # Create exact match conditions for each category
+            category_conditions = []
+            for category in categories:
+                if not category:
+                    continue
+                    
+                # Exact match condition (case-insensitive)
+                category_conditions.append(
+                    models.FieldCondition(
+                        key="category",
+                        match=models.MatchValue(value=category)
+                    )
+                )
+                
+                # Also check for category in the name or description for better matching
+                category_conditions.extend([
+                    models.FieldCondition(
+                        key="name",
+                        match=models.MatchText(
+                            text=category,
+                            params=models.TextIndexParams(
+                                type="text",
+                                tokenizer=models.TokenizerType.WORD,
+                                lowercase=True,
+                                min_token_len=len(category)
+                            )
+                        )
+                    ),
+                    models.FieldCondition(
+                        key="description",
+                        match=models.MatchText(
+                            text=category,
+                            params=models.TextIndexParams(
+                                type="text",
+                                tokenizer=models.TokenizerType.WORD,
+                                lowercase=True,
+                                min_token_len=len(category)
+                            )
+                        )
+                    )
+                ])
+            
+            if not category_conditions:
+                logger.warning("No valid category conditions created")
+                return []
+                
+            # Create the filter with OR condition for categories
+            search_filter = models.Filter(
+                must=[
+                    models.Filter(
+                        should=category_conditions,
+                        min_should_match=1
+                    )
+                ]
+            )
+            
+            # First try with a higher score threshold
+            search_result = self.client.search(
+                collection_name=collection_name,
+                query_vector=models.NamedVector(
+                    name=vector_name,
+                    vector=query_vector
+                ) if isinstance(query_vector, list) else query_vector,
+                query_filter=search_filter,
+                limit=top_k * 2,  # Get more results for post-filtering
+                score_threshold=score_threshold,
+                with_payload=True,
+                with_vectors=False
+            )
+            
+            # Post-filter results to ensure they match the category
+            filtered_results = []
+            for result in search_result:
+                payload = getattr(result, 'payload', {}) or {}
+                result_category = str(payload.get('category', '')).lower()
+                
+                # Check if the result's category matches any of the target categories
+                if any(cat in result_category or result_category in cat for cat in categories):
+                    filtered_results.append(result)
+                    if len(filtered_results) >= top_k:
+                        break
+            
+            logger.info(f"Found {len(filtered_results)} results after category filtering")
+            return filtered_results
+            
+        except Exception as e:
+            logger.error(f"Error in category-filtered search: {str(e)}", exc_info=True)
+            # Fallback to regular search without category filter
+            return self.search(
+                collection_name=collection_name,
+                query_vector=query_vector,
+                vector_name=vector_name,
+                top_k=top_k,
+                score_threshold=score_threshold
+            )
