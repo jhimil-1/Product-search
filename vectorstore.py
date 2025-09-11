@@ -195,6 +195,8 @@ class VectorStore:
                     # Process image vector if present
                     if 'image' in point['vector'] and point['vector']['image'] and len(point['vector']['image']) == 512:
                         vectors['image'] = point['vector']['image']
+                    else:
+                        logger.info(f"No image vector for point {point.get('id')}, proceeding with text vector only")
                     
                     # Create point with validated vectors
                     qdrant_point = models.PointStruct(
@@ -212,16 +214,37 @@ class VectorStore:
                 logger.error("No valid points to upsert after validation")
                 return False
             
-            # Upsert the points in batches of 50
-            batch_size = 50
+            # Upsert the points in smaller batches for better error handling
+            batch_size = 25  # Reduced batch size for better stability
             for i in range(0, len(qdrant_points), batch_size):
                 batch = qdrant_points[i:i + batch_size]
-                self.client.upsert(
-                    collection_name=collection_name,
-                    points=batch,
-                    wait=True
-                )
-                logger.info(f"Upserted batch {i//batch_size + 1} with {len(batch)} points")
+                try:
+                    self.client.upsert(
+                        collection_name=collection_name,
+                        points=batch,
+                        wait=True
+                    )
+                    logger.info(f"Upserted batch {i//batch_size + 1} with {len(batch)} points")
+                except Exception as e:
+                    logger.error(f"Error upserting batch {i//batch_size + 1}: {str(e)}")
+                    # Try with even smaller batch if this fails
+                    if len(batch) > 5:
+                        logger.info("Retrying with smaller batches")
+                        small_batch_size = 5
+                        for j in range(0, len(batch), small_batch_size):
+                            small_batch = batch[j:j + small_batch_size]
+                            try:
+                                self.client.upsert(
+                                    collection_name=collection_name,
+                                    points=small_batch,
+                                    wait=True
+                                )
+                                logger.info(f"Upserted small batch with {len(small_batch)} points")
+                            except Exception as e2:
+                                logger.error(f"Error upserting small batch: {str(e2)}")
+                                return False
+                    else:
+                        return False
             
             logger.info(f"Successfully upserted {len(qdrant_points)} points to {collection_name}")
             return True
@@ -891,41 +914,13 @@ class VectorStore:
                 if not category:
                     continue
                     
-                # Exact match condition (case-insensitive)
+                # Strict exact match condition on category field only
                 category_conditions.append(
                     models.FieldCondition(
                         key="category",
-                        match=models.MatchValue(value=category)
+                        match=models.MatchValue(value=category.lower().strip())
                     )
                 )
-                
-                # Also check for category in the name or description for better matching
-                category_conditions.extend([
-                    models.FieldCondition(
-                        key="name",
-                        match=models.MatchText(
-                            text=category,
-                            params=models.TextIndexParams(
-                                type="text",
-                                tokenizer=models.TokenizerType.WORD,
-                                lowercase=True,
-                                min_token_len=len(category)
-                            )
-                        )
-                    ),
-                    models.FieldCondition(
-                        key="description",
-                        match=models.MatchText(
-                            text=category,
-                            params=models.TextIndexParams(
-                                type="text",
-                                tokenizer=models.TokenizerType.WORD,
-                                lowercase=True,
-                                min_token_len=len(category)
-                            )
-                        )
-                    )
-                ])
             
             if not category_conditions:
                 logger.warning("No valid category conditions created")
@@ -955,19 +950,32 @@ class VectorStore:
                 with_vectors=False
             )
             
-            # Post-filter results to ensure they match the category
+            # Post-filter results to ensure they match the category exactly
             filtered_results = []
             for result in search_result:
                 payload = getattr(result, 'payload', {}) or {}
                 result_category = str(payload.get('category', '')).lower()
                 
-                # Check if the result's category matches any of the target categories
-                if any(cat in result_category or result_category in cat for cat in categories):
+                # Split categories if multiple are present (comma-separated)
+                result_categories = [cat.strip() for cat in result_category.split(',')]
+                
+                # Check if the result's category exactly matches any of the target categories
+                # Only allow exact matches, not partial matches
+                is_category_match = False
+                for cat in categories:
+                    for result_cat in result_categories:
+                        if cat == result_cat:  # Exact match only
+                            is_category_match = True
+                            break
+                    if is_category_match:
+                        break
+                        
+                if is_category_match:
                     filtered_results.append(result)
                     if len(filtered_results) >= top_k:
                         break
             
-            logger.info(f"Found {len(filtered_results)} results after category filtering")
+            logger.info(f"Found {len(filtered_results)} results after strict category filtering")
             return filtered_results
             
         except Exception as e:

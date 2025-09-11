@@ -543,11 +543,17 @@
           }
         }
         
-        // Check image count matches product count
+        // Check image count matches product count if images are provided
         if (imageFiles.length > 0 && imageFiles.length !== products.length) {
           statusDiv.textContent = `Number of images (${imageFiles.length}) must match number of products (${products.length})`;
           statusDiv.style.color = "#f44336";
           return;
+        }
+        
+        // Warn user if uploading many products with no images
+        if (imageFiles.length === 0 && products.length > 5) {
+          statusDiv.textContent = `Uploading ${products.length} products with no images. This may take a moment...`;
+          statusDiv.style.color = "#FF9800";
         }
         
         // Add image_filename to each product if not present
@@ -573,11 +579,51 @@
         
         console.log('Sending form data with', products.length, 'products and', imageFiles.length, 'images');
         
-        // Send request
-        const response = await fetch(`/upload_products/${sessionId}`, {
-          method: "POST",
-          body: formData
-        });
+        // Set longer timeout for large requests with no images
+        const timeoutMs = (products.length > 5 && imageFiles.length === 0) ? 60000 : 30000;
+        
+        // Function to fetch with timeout
+        const fetchWithTimeout = async (url, options, timeout) => {
+          const controller = new AbortController();
+          const id = setTimeout(() => controller.abort(), timeout);
+          
+          try {
+            const response = await fetch(url, {
+              ...options,
+              signal: controller.signal
+            });
+            clearTimeout(id);
+            return response;
+          } catch (error) {
+            clearTimeout(id);
+            throw error;
+          }
+        };
+        
+        // Send request with retry logic
+        let retries = 0;
+        let response;
+        
+        while (retries < 3) {
+          try {
+            statusDiv.textContent = `Uploading products${retries > 0 ? ` (attempt ${retries + 1})` : ''}...`;
+            response = await fetchWithTimeout(`/upload_products/${sessionId}`, {
+              method: "POST",
+              body: formData
+            }, timeoutMs);
+            break;
+          } catch (error) {
+            retries++;
+            console.error(`Upload attempt ${retries} failed:`, error);
+            
+            if (retries >= 3) {
+              throw new Error(`Failed after ${retries} attempts: ${error.message}`);
+            }
+            
+            // Wait before retrying (exponential backoff)
+            await new Promise(resolve => setTimeout(resolve, 1000 * retries));
+          }
+        }
         
         if (!response.ok) {
           const errorData = await response.json().catch(() => ({}));

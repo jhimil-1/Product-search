@@ -455,6 +455,7 @@ def upload_products(session_id):
             return jsonify({"error": "Products data should be an array"}), 400
 
         # Process file uploads if any
+        uploaded_files = []
         if 'images' in request.files:
             uploaded_files = request.files.getlist('images')
             logger.info(f"Received {len(uploaded_files)} image files")
@@ -471,6 +472,8 @@ def upload_products(session_id):
                         logger.info(f"Saved uploaded file: {filepath}")
                     except Exception as e:
                         logger.error(f"Error saving file {filename}: {str(e)}")
+        else:
+            logger.info("No images received in the request")
         
         # Get the collection name for this session
         session_data = sessions_col.find_one({"_id": session_id})
@@ -511,12 +514,14 @@ def upload_products(session_id):
                 detected_categories = detect_jewelry_category(f"{name} {description} {category_raw}")
                 
                 # Use detected categories or fallback to raw category
+                # Only use the primary/first category to avoid cross-category search issues
                 if detected_categories:
-                    # Join multiple categories with comma for storage
-                    category = ', '.join(detected_categories)
+                    # Use only the first/primary category for more accurate search results
+                    category = detected_categories[0]
                 else:
                     # If no category detected, use the raw category or default to 'jewelry'
-                    category = category_raw if category_raw else 'jewelry'
+                    # If raw category contains multiple comma-separated values, only use the first one
+                    category = category_raw.split(',')[0].strip() if category_raw else 'jewelry'
                 
                 # Ensure category is properly formatted for indexing
                 category = ' '.join(word.strip() for word in category.split() if word.strip())
@@ -564,6 +569,8 @@ def upload_products(session_id):
                     # Add image vector if available
                     if image_embedding and len(image_embedding) == 512:
                         vector_dict['image'] = image_embedding
+                    else:
+                        logger.info(f"No image embedding for product {product_id}, proceeding with text embedding only")
                     
                     # Add product to points list
                     points.append({
@@ -597,7 +604,10 @@ def upload_products(session_id):
             return jsonify({"error": f"Failed to create collection: {str(e)}"}), 500
         
         # Process products in batches
-        batch_size = 5  # Reduced batch size for better error handling
+        # Use smaller batch size for uploads with many products and no images
+        batch_size = 3 if len(points) > 5 and all('image' not in p['vector'] for p in points) else 5
+        logger.info(f"Using batch size of {batch_size} for {len(points)} products")
+        
         success_count = 0
         error_count = 0
         
@@ -610,6 +620,8 @@ def upload_products(session_id):
                     logger.info(f"Text vector length: {len(point['vector']['text'])}")
                     if 'image' in point['vector']:
                         logger.info(f"Image vector length: {len(point['vector']['image'])}")
+                    else:
+                        logger.info(f"No image vector for point {point['id']}")
                 
                 # Add batch to Qdrant
                 success = vector_store.upsert_points(collection_name, batch)
@@ -718,9 +730,19 @@ def handle_product_search(query: str, session_id: str, collection_name: str):
                         payload = getattr(result, 'payload', {}) or {}
                         result_category = str(payload.get('category', '')).lower()
                         
-                        # Check if result category matches any detected category
-                        if any(cat in result_category or result_category in cat 
-                             for cat in detected_categories):
+                        # Split categories if multiple are present (comma-separated)
+                        result_categories = [cat.strip() for cat in result_category.split(',')]
+                        
+                        # Check if result category EXACTLY matches any detected category
+                        is_category_match = False
+                        for detected_cat in detected_categories:
+                            detected_cat_lower = detected_cat.lower()
+                            # Check for exact category match
+                            if detected_cat_lower in result_categories:
+                                is_category_match = True
+                                break
+                        
+                        if is_category_match:
                             filtered_results.append(result)
                             if len(filtered_results) >= 10:  # Limit to top 10
                                 break
@@ -879,12 +901,17 @@ def format_product_results(results, session_id):
                 logger.warning(f"Invalid payload type: {type(payload)}")
                 continue
             
-            # Create unique identifier for deduplication
-            product_key = f"{payload.get('name', '')}_{payload.get('description', '')}"
+            # Create more specific unique identifier for deduplication
+            product_key = f"{payload.get('name', '')}_{payload.get('category', '')}_{payload.get('price', '')}"
             if not product_key.strip('_') or product_key in seen_products:
                 continue
                 
             seen_products.add(product_key)
+            
+            # Get and normalize category
+            category = str(payload.get('category', '')).lower().strip()
+            if not category:
+                category = 'uncategorized'
             
             # Convert score to percentage format
             percentage_score = min(100.0, max(0.0, score * 100))
@@ -897,8 +924,9 @@ def format_product_results(results, session_id):
                 'name': str(payload.get('name', 'Unnamed Product')).strip(),
                 'description': str(payload.get('description', '')).strip(),
                 'price': str(payload.get('price', 'N/A')).strip(),
-                'category': str(payload.get('category', 'Uncategorized')).strip(),
-                'score': round(percentage_score, 2)  # Round to 2 decimal places
+                'category': category,  # Use normalized category
+                'score': round(percentage_score, 2),  # Round to 2 decimal places
+                'original_category': str(payload.get('category', '')).strip()  # Keep original for reference
             }
             
             # Handle image URL - prioritize Qdrant image data over external URLs
@@ -923,8 +951,8 @@ def format_product_results(results, session_id):
             logger.error(f"Error formatting product result: {str(e)}\nResult: {result}", exc_info=True)
             continue
     
-    # Sort by score in descending order
-    formatted_results.sort(key=lambda x: x.get('score', 0), reverse=True)
+    # Sort by score in descending order, then by name for consistent ordering
+    formatted_results.sort(key=lambda x: (-x.get('score', 0), x.get('name', '').lower()))
     
     return formatted_results
 
@@ -951,29 +979,55 @@ def query_image(session_id):
             
         collection_name = session_data['collection_name']
         
-        # Enhanced category detection from multiple sources
+        # Enhanced category detection from multiple sources with priority
         filename = file.filename or ""
-        user_context = request.form.get('context', '')
-        query_text = request.form.get('query', '')  # Additional query text if provided
+        user_context = request.form.get('context', '').lower()
+        query_text = request.form.get('query', '').lower()  # Additional query text if provided
         
-        # Combine all available context for category detection
-        all_context = f"{filename} {user_context} {query_text}"
-        detected_categories = extract_category_from_image_query(all_context)
+        # Priority 1: Check explicit category in the query text first
+        detected_categories = []
         
-        # Also try to detect from common image naming patterns
-        if not detected_categories:
-            # Check for common patterns in filenames
+        # Check for explicit category mentions in the query
+        category_keywords = {
+            'ring': ['\bring\b', '\bbands?\b', '\bengagement\b', '\bwedding band\b', '\bsignet\b'],
+            'earring': ['\bearrings?\b', '\bstuds?\b', '\bhoops?\b', '\bdangle\b', '\bear rings?\b', '\bear-rings?\b'],
+            'necklace': ['\bnecklaces?\b', '\bpendants?\b', '\bchains?\b', '\bchokers?\b', '\blockets?\b', '\bcollars?\b'],
+            'bracelet': ['\bbracelets?\b', '\bbangles?\b', '\bcuffs?\b', '\bcharms?\b', '\btennis\b', '\bchain bracelets?\b'],
+            'set': ['\bsets?\b', '\bmatching sets?\b', '\bjewelry sets?\b', '\bpairs?\b']
+        }
+        
+        # Check query text first (highest priority)
+        for category, keywords in category_keywords.items():
+            if any(re.search(rf'\b{kw}\b', query_text) for kw in keywords):
+                detected_categories = [category]
+                logger.info(f"Detected category '{category}' from query text")
+                break
+        
+        # If no category in query, check filename
+        if not detected_categories and filename:
             filename_lower = filename.lower()
-            if any(word in filename_lower for word in ['necklace', 'chain', 'pendant']):
-                detected_categories = ['necklace']
-            elif any(word in filename_lower for word in ['ring', 'band', 'engagement']):
-                detected_categories = ['ring']
-            elif any(word in filename_lower for word in ['bracelet', 'bangle']):
-                detected_categories = ['bracelet']
-            elif any(word in filename_lower for word in ['earring', 'stud', 'hoop']):
-                detected_categories = ['earring']
+            for category, keywords in category_keywords.items():
+                if any(kw in filename_lower for kw in [k.replace('\\b', '') for k in keywords]):
+                    detected_categories = [category]
+                    logger.info(f"Detected category '{category}' from filename")
+                    break
         
-        logger.info(f"Image search context: filename='{filename}', user_context='{user_context}', detected_categories={detected_categories}")
+        # If still no category, check user context
+        if not detected_categories and user_context:
+            for category, keywords in category_keywords.items():
+                if any(re.search(rf'\b{kw}\b', user_context) for kw in keywords):
+                    detected_categories = [category]
+                    logger.info(f"Detected category '{category}' from user context")
+                    break
+        
+        # If still no category, use the extract_category_from_image_query as fallback
+        if not detected_categories:
+            all_context = f"{filename} {user_context} {query_text}".strip()
+            if all_context:
+                detected_categories = extract_category_from_image_query(all_context)
+        
+        logger.info(f"Image search context: filename='{filename}', query='{query_text}', "
+                  f"user_context='{user_context}', detected_categories={detected_categories}")
         
         # Generate embedding for the image
         try:
@@ -991,22 +1045,49 @@ def query_image(session_id):
             if detected_categories:
                 try:
                     logger.info(f"Stage 1: Strict category filtering for: {detected_categories}")
+                    # First try with a higher threshold for better precision
                     results = vector_store.search_with_category_filter(
                         collection_name=collection_name,
                         query_vector=image_embedding,
                         vector_name="image",
                         categories=detected_categories,
-                        top_k=10,
-                        score_threshold=0.4  # Slightly lower threshold to ensure we get results
+                        top_k=15,  # Get more results to ensure we have enough after filtering
+                        score_threshold=0.5
                     )
                     
                     if results:
                         logger.info(f"Found {len(results)} results with strict category filter")
+                        
+                        # Ensure results match the detected categories exactly
+                        filtered_results = []
+                        for result in results:
+                            payload = getattr(result, 'payload', {}) or {}
+                            result_category = str(payload.get('category', '')).lower().strip()
+                            
+                            # Check if result category matches any detected category exactly
+                            # Use exact matching only - don't allow partial matches
+                            is_category_match = False
+                            for detected_cat in detected_categories:
+                                detected_cat_lower = detected_cat.lower()
+                                for result_cat in [c.strip() for c in result_category.split(',')]:
+                                    if detected_cat_lower == result_cat:
+                                        is_category_match = True
+                                        break
+                                if is_category_match:
+                                    break
+                            
+                            if is_category_match:
+                                filtered_results.append(result)
+                                if len(filtered_results) >= 10:  # Limit to top 10 matches
+                                    break
+                        
+                        results = filtered_results
+                        logger.info(f"Kept {len(results)} results after exact category matching")
                     else:
                         logger.info("No results with strict category filter")
                 
                 except Exception as e:
-                    logger.warning(f"Category filter search failed: {str(e)}")
+                    logger.warning(f"Category filter search failed: {str(e)}", exc_info=True)
                     results = None
             
             # Stage 2: Broader image search without strict category filtering
@@ -1020,36 +1101,100 @@ def query_image(session_id):
                     score_threshold=0.1  # Even lower threshold for broader search
                 )
             
-            # Stage 3: Strict category filtering for image search results
-            if results and detected_categories:
-                logger.info(f"Stage 3: Strict category filtering for: {detected_categories}")
+            # Stage 3: Final filtering and validation of results
+            if results:
+                logger.info("Stage 3: Final result validation and filtering")
                 
-                filtered_results = []
+                valid_results = []
+                seen_products = set()
                 
                 for result in results:
-                    payload = getattr(result, 'payload', {}) or {}
-                    result_category = str(payload.get('category', '')).lower().strip()
-                    
-                    # Check if result category matches any detected category
-                    is_category_match = any(
-                        detected_cat.lower() == result_category or 
-                        detected_cat.lower() in result_category or 
-                        result_category in detected_cat.lower()
-                        for detected_cat in detected_categories
-                    )
-                    
-                    if is_category_match:
-                        filtered_results.append(result)
+                    try:
+                        payload = getattr(result, 'payload', {}) or {}
+                        if not payload:
+                            continue
+                            
+                        # Extract and validate product details
+                        product_id = str(payload.get('product_id', '')).strip()
+                        name = str(payload.get('name', '')).strip()
+                        category = str(payload.get('category', '')).lower().strip()
+                        
+                        # Skip if missing critical fields
+                        if not all([name, category, product_id]):
+                            logger.debug(f"Skipping result - missing required fields: {payload}")
+                            continue
+                        
+                        # Create a unique key for deduplication
+                        product_key = f"{name}_{category}"
+                        if product_key in seen_products:
+                            continue
+                            
+                        seen_products.add(product_key)
+                        
+                        # Strict category validation if we have detected categories
+                        if detected_categories:
+                            # Normalize the result's category for comparison
+                            result_categories = [c.strip().lower() for c in category.split(',')]
+                            
+                            # Check if any detected category EXACTLY matches the result's categories
+                            # Only allow exact matches, not partial matches
+                            category_match = False
+                            for detected_cat in detected_categories:
+                                for result_cat in result_categories:
+                                    if detected_cat == result_cat:  # Exact match only
+                                        category_match = True
+                                        break
+                                if category_match:
+                                    break
+                            
+                            if not category_match:
+                                logger.debug(f"Skipping result - category mismatch: {category} not in {detected_categories}")
+                                continue
+                        
+                        # Enhanced image validation
+                        has_image = False
+                        image_url = ''
+                        
+                        # Check for base64 image data first (highest priority)
+                        if payload.get('image_data'):
+                            try:
+                                # Basic validation of base64 data
+                                if isinstance(payload['image_data'], str) and len(payload['image_data']) > 100:
+                                    has_image = True
+                                    image_url = f"/api/images/{product_id}?session_id={session_id}"
+                            except Exception as e:
+                                logger.warning(f"Invalid image data for product {product_id}: {str(e)}")
+                        
+                        # Fall back to URL if no embedded image
+                        if not has_image and payload.get('image_url'):
+                            img_url = str(payload['image_url']).strip()
+                            if img_url.startswith(('http://', 'https://', '/api/images/')):
+                                has_image = True
+                                image_url = img_url if img_url.startswith(('http://', 'https://')) else f"{img_url}?session_id={session_id}"
+                        
+                        if not has_image:
+                            logger.debug(f"Skipping result - no valid image: {product_key}")
+                            continue
+                        
+                        # Add the image URL to the result for easy access
+                        if hasattr(result, 'payload'):
+                            result.payload['_image_url'] = image_url
+                        
+                        valid_results.append(result)
+                        
+                        if len(valid_results) >= 6:  # Limit to top 6 matches
+                            break
+                            
+                    except Exception as e:
+                        logger.warning(f"Error processing result: {str(e)}", exc_info=True)
+                        continue
                 
-                # Only return results that match the detected categories
-                if filtered_results:
-                    results = filtered_results[:6]  # Limit to top 6 category matches
-                    logger.info(f"Found {len(filtered_results)} results matching categories: {detected_categories}")
-                else:
-                    # If no category matches, indicate this in the response
-                    logger.info(f"No results found matching categories: {detected_categories}")
+                results = valid_results
+                logger.info(f"Kept {len(results)} valid results after filtering")
+                
+                if not results:
                     return jsonify({
-                        "message": f"No products found matching categories: {', '.join(detected_categories)}. Try a different image or search term.",
+                        "message": "No valid products found with matching images. Please try a different search.",
                         "results": []
                     })
             else:
