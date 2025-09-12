@@ -956,24 +956,35 @@ class VectorStore:
                 payload = getattr(result, 'payload', {}) or {}
                 result_category = str(payload.get('category', '')).lower()
                 
-                # Split categories if multiple are present (comma-separated)
-                result_categories = [cat.strip() for cat in result_category.split(',')]
+                # Skip if no category is available
+                if not result_category:
+                    logger.debug(f"Skipping result with no category: {payload.get('name', 'Unnamed')}")
+                    continue
                 
-                # Check if the result's category exactly matches any of the target categories
-                # Only allow exact matches, not partial matches
-                is_category_match = False
-                for cat in categories:
-                    for result_cat in result_categories:
-                        if cat == result_cat:  # Exact match only
-                            is_category_match = True
-                            break
-                    if is_category_match:
-                        break
-                        
+                # Split categories if multiple are present (comma-separated) and clean them up
+                result_categories = [cat.strip().lower() for cat in result_category.split(',') if cat.strip()]
+                
+                # Debug logging
+                logger.debug(f"Checking categories for product: {payload.get('name', 'Unnamed')}")
+                logger.debug(f"Result categories: {result_categories}")
+                logger.debug(f"Target categories: {categories}")
+                
+                # Check if any of the result's categories exactly match any of the target categories
+                is_category_match = any(
+                    any(
+                        target_cat == result_cat
+                        for result_cat in result_categories
+                    )
+                    for target_cat in categories
+                )
+                
                 if is_category_match:
                     filtered_results.append(result)
+                    logger.debug(f"Added product to results: {payload.get('name', 'Unnamed')} with categories: {result_categories}")
                     if len(filtered_results) >= top_k:
                         break
+                else:
+                    logger.debug(f"Excluded product due to category mismatch: {payload.get('name', 'Unnamed')} with categories: {result_categories}")
             
             logger.info(f"Found {len(filtered_results)} results after strict category filtering")
             return filtered_results

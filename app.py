@@ -1046,40 +1046,52 @@ def query_image(session_id):
                 try:
                     logger.info(f"Stage 1: Strict category filtering for: {detected_categories}")
                     # First try with a higher threshold for better precision
+                    # Log the exact categories we're searching for
+                    logger.info(f"Searching with strict category filter for: {detected_categories}")
+                    
+                    # First try with a higher threshold for better precision
                     results = vector_store.search_with_category_filter(
                         collection_name=collection_name,
                         query_vector=image_embedding,
                         vector_name="image",
                         categories=detected_categories,
                         top_k=15,  # Get more results to ensure we have enough after filtering
-                        score_threshold=0.5
+                        score_threshold=0.6  # Higher threshold for better precision
                     )
                     
                     if results:
                         logger.info(f"Found {len(results)} results with strict category filter")
                         
-                        # Ensure results match the detected categories exactly
+                        # Additional client-side filtering for extra safety
                         filtered_results = []
                         for result in results:
                             payload = getattr(result, 'payload', {}) or {}
-                            result_category = str(payload.get('category', '')).lower().strip()
+                            result_category = str(payload.get('category', '')).lower()
                             
-                            # Check if result category matches any detected category exactly
-                            # Use exact matching only - don't allow partial matches
-                            is_category_match = False
-                            for detected_cat in detected_categories:
-                                detected_cat_lower = detected_cat.lower()
-                                for result_cat in [c.strip() for c in result_category.split(',')]:
-                                    if detected_cat_lower == result_cat:
-                                        is_category_match = True
-                                        break
-                                if is_category_match:
-                                    break
+                            # Skip if no category is available
+                            if not result_category:
+                                logger.debug(f"Skipping result with no category: {payload.get('name', 'Unnamed')}")
+                                continue
+                            
+                            # Split categories and clean them up
+                            result_categories = [cat.strip().lower() for cat in result_category.split(',') if cat.strip()]
+                            
+                            # Check if any of the result's categories exactly match any of the target categories
+                            is_category_match = any(
+                                any(
+                                    detected_cat.lower() == result_cat
+                                    for result_cat in result_categories
+                                )
+                                for detected_cat in detected_categories
+                            )
                             
                             if is_category_match:
                                 filtered_results.append(result)
+                                logger.debug(f"Added product to results: {payload.get('name', 'Unnamed')} with categories: {result_categories}")
                                 if len(filtered_results) >= 10:  # Limit to top 10 matches
                                     break
+                            else:
+                                logger.debug(f"Excluded product due to category mismatch: {payload.get('name', 'Unnamed')} with categories: {result_categories}")
                         
                         results = filtered_results
                         logger.info(f"Kept {len(results)} results after exact category matching")
@@ -1090,14 +1102,31 @@ def query_image(session_id):
                     logger.warning(f"Category filter search failed: {str(e)}", exc_info=True)
                     results = None
             
-            # Stage 2: Broader image search without strict category filtering
+            # Stage 2: Broader image search with relaxed category filtering
+            if not results and detected_categories:
+                logger.info(f"Stage 2: Relaxed category filtering for: {detected_categories}")
+                try:
+                    # Try with a lower threshold but still with category filtering
+                    results = vector_store.search_with_category_filter(
+                        collection_name=collection_name,
+                        query_vector=image_embedding,
+                        vector_name="image",
+                        categories=detected_categories,
+                        top_k=10,
+                        score_threshold=0.4  # Slightly lower threshold
+                    )
+                    logger.info(f"Found {len(results) if results else 0} results with relaxed category filter")
+                except Exception as e:
+                    logger.warning(f"Relaxed category filter search failed: {str(e)}", exc_info=True)
+            
+            # Stage 3: Last resort - search without any category filtering
             if not results:
-                logger.info("Stage 2: Broader image search without category filter")
+                logger.info("Stage 3: Fallback search without any category filtering")
                 results = vector_store.search(
                     collection_name=collection_name,
                     query_vector=image_embedding,
                     vector_name="image",
-                    top_k=15,
+                    top_k=10,
                     score_threshold=0.1  # Even lower threshold for broader search
                 )
             
