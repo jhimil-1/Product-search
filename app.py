@@ -1241,46 +1241,61 @@ def query_image(session_id):
 def get_image(product_id):
     """Serve image data directly from Qdrant for a given product ID"""
     try:
+        logger.info(f"Fetching image for product ID: {product_id}")
+        
         # Get the session ID from the query parameters
         session_id = request.args.get('session_id')
         if not session_id:
+            logger.warning("No session_id provided in request")
             return jsonify({"error": "Session ID is required"}), 400
             
         # Get the collection name for this session
+        logger.debug(f"Looking up session: {session_id}")
         session_data = sessions_col.find_one({"_id": session_id})
         if not session_data or 'collection_name' not in session_data:
-            return jsonify({"error": "Invalid session"}), 404
+            logger.warning(f"Invalid or missing session data for session_id: {session_id}")
+            return jsonify({"error": "Invalid or expired session"}), 404
             
         collection_name = session_data['collection_name']
+        logger.debug(f"Using collection: {collection_name}")
         
         # First try to get the point directly by ID (as string)
         try:
+            logger.debug(f"Attempting direct lookup of product ID: {product_id}")
             point = vector_store.client.retrieve(
                 collection_name=collection_name,
                 ids=[str(product_id)],  # Ensure ID is string
                 with_payload=True,
                 with_vectors=False
             )
+            
             if point and len(point) > 0:
                 payload = point[0].payload or {}
                 if not payload and hasattr(point[0], 'get'):
                     payload = {k: v for k, v in point[0].items() if k != 'payload'}
                 if payload:
+                    logger.debug(f"Found product with direct lookup: {product_id}")
                     return _serve_image(payload, product_id)
+                else:
+                    logger.warning(f"Empty payload for product ID: {product_id}")
+            else:
+                logger.debug(f"No direct match found for product ID: {product_id}")
+                
         except Exception as e:
-            logger.debug(f"Could not retrieve point directly: {str(e)}")
+            logger.error(f"Error in direct product lookup: {str(e)}", exc_info=True)
         
         # Try searching in the payload with different field names
         search_fields = ["product_id", "id", "_id", "name"]
         
         for field in search_fields:
             try:
+                logger.debug(f"Searching by field '{field}' for value: {product_id}")
                 results = vector_store.client.scroll(
                     collection_name=collection_name,
                     scroll_filter=models.Filter(
                         must=[
                             models.FieldCondition(
-                                key=f"payload.{field}",
+                                key=field,
                                 match=models.MatchValue(value=product_id)
                             )
                         ]
@@ -1292,45 +1307,24 @@ def get_image(product_id):
                 
                 if results and len(results[0]) > 0:
                     payload = results[0][0].payload or {}
-                    if not payload and hasattr(results[0][0], 'get'):
-                        payload = {k: v for k, v in results[0][0].items() if k != 'payload'}
                     if payload:
+                        logger.debug(f"Found product by {field} lookup: {product_id}")
                         return _serve_image(payload, product_id)
-                        
+                    else:
+                        logger.warning(f"Empty payload in search by {field} for ID: {product_id}")
+                else:
+                    logger.debug(f"No match found for {field}={product_id}")
+                    
             except Exception as e:
-                logger.debug(f"Search by {field} failed: {str(e)}")
+                logger.error(f"Search by {field} failed: {str(e)}", exc_info=True)
                 continue
         
-        # If still not found, try to find by partial match in name or description
-        try:
-            all_products = vector_store.client.scroll(
-                collection_name=collection_name,
-                limit=100,  # Adjust based on expected collection size
-                with_payload=True,
-                with_vectors=False
-            )
-            
-            for product in all_products[0]:
-                payload = product.payload or {}
-                if not payload and hasattr(product, 'get'):
-                    payload = {k: v for k, v in product.items() if k != 'payload'}
-                
-                # Try to find a match in common fields
-                for field in ['name', 'description', 'title', 'product_name']:
-                    if field in payload and str(product_id).lower() in str(payload[field]).lower():
-                        return _serve_image(payload, product_id)
-                
-                # Try direct ID match in different formats
-                for id_field in ['id', 'product_id', '_id']:
-                    if id_field in payload and str(payload[id_field]) == str(product_id):
-                        return _serve_image(payload, product_id)
-            
-            logger.warning(f"Product {product_id} not found in collection {collection_name}")
-            return jsonify({"error": "Product not found"}), 404
-            
-        except Exception as e:
-            logger.error(f"Error retrieving products from collection: {str(e)}", exc_info=True)
-            return jsonify({"error": "Failed to search products"}), 500
+        # If we get here, no product was found with any search method
+        logger.warning(f"Product {product_id} not found in collection {collection_name}")
+        return jsonify({
+            "error": "Product not found",
+            "details": f"No product found with ID: {product_id} in collection: {collection_name}"
+        }), 404
             
     except Exception as e:
         logger.error(f"Error in get_image: {str(e)}", exc_info=True)
