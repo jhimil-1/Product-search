@@ -2,7 +2,7 @@ from qdrant_client import QdrantClient
 from qdrant_client.http import models
 from qdrant_client.http.exceptions import UnexpectedResponse
 import logging
-from embeddings import TEXT_EMBEDDING_DIM, IMAGE_EMBEDDING_DIM
+from embeddings import TEXT_EMBEDDING_DIM, IMAGE_EMBEDDING_DIM, embed_text
 from typing import Optional, List, Dict, Any, Union, Tuple
 import uuid
 import base64
@@ -336,6 +336,7 @@ class VectorStore:
                     'payload': {
                         'product_id': product.get('product_id', ''),
                         'name': product.get('name', ''),
+                        'name_lower': product.get('name', '').lower(),  # For case-insensitive search
                         'description': product.get('description', ''),
                         'price': str(product.get('price', '')),
                         'category': product.get('category', '').lower(),
@@ -876,6 +877,60 @@ class VectorStore:
             
         except Exception as e:
             logger.error(f"Error in search: {str(e)}", exc_info=True)
+            return []
+
+    def search_with_name(self, collection_name, product_name, exact_match=True, top_k=1, score_threshold=0.8):
+        """
+        Search for products by name with exact or fuzzy matching.
+        
+        Args:
+            collection_name: Name of the collection to search in
+            product_name: Name of the product to search for
+            exact_match: If True, perform exact name matching. If False, use semantic search.
+            top_k: Number of results to return
+            score_threshold: Minimum similarity score for results
+            
+        Returns:
+            List of matching products with their data
+        """
+        try:
+            if exact_match:
+                # First try exact match with filter on name_lower for case-insensitive search
+                query_name = product_name.strip().lower()
+                results = self.client.scroll(
+                    collection_name=collection_name,
+                    scroll_filter=models.Filter(
+                        must=[
+                            models.FieldCondition(
+                                key="name_lower",
+                                match=models.MatchValue(value=query_name)
+                            )
+                        ]
+                    ),
+                    limit=top_k,
+                    with_vectors=False,
+                    with_payload=True
+                )
+                
+                if results and len(results) > 0 and len(results[0]) > 0:
+                    return [hit.payload for hit in results[0]]
+                    
+                return []
+                
+            else:
+                # Semantic search with name as query
+                query_vector = embed_text(product_name)
+                search_result = self.client.search(
+                    collection_name=collection_name,
+                    query_vector=("text", query_vector),
+                    query_filter=None,
+                    limit=top_k,
+                    score_threshold=score_threshold
+                )
+                return [hit.payload for hit in search_result]
+                
+        except Exception as e:
+            logger.error(f"Error in search_with_name: {str(e)}", exc_info=True)
             return []
 
     def search_with_category_filter(self, collection_name, query_vector, categories, vector_name="text", top_k=5, score_threshold=0.5):

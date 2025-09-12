@@ -773,26 +773,46 @@
             }
             
             if (response.ok) {
-              // Display the message from the server
-              if (data.message) {
+              // If this is an exact match (like a price query), only show the message
+              if (data.exact_match && data.message) {
                 addMessage("bot", data.message);
-              }
-              
-              // Display results if available
-              if (data.results && Array.isArray(data.results) && data.results.length > 0) {
-                data.results.forEach(product => {
-                  const scoreText = product.score ? `${Math.round(product.score)}` : '';
-                  addMessage("bot", {
-                    name: product.name || 'Unnamed Product',
-                    price: product.price || '',
-                    category: product.category || '',
-                    description: product.description || '',
-                    image_url: product.image_url || '',
-                    score: scoreText
-                  }, true);
-                });
-              } else if (!data.message) {
-                addMessage("bot", "No matching products found.");
+                
+                // Still show the product card but without the score
+                if (data.results && data.results.length > 0) {
+                  data.results.forEach(product => {
+                    addMessage("bot", {
+                      name: product.name || 'Unnamed Product',
+                      price: product.price || '',
+                      category: product.category || '',
+                      description: product.description || '',
+                      image_url: product.image_url || ''
+                    }, true);
+                  });
+                }
+              } 
+              // For regular searches, show the message and all results with scores
+              else {
+                // Display the message from the server
+                if (data.message) {
+                  addMessage("bot", data.message);
+                }
+                
+                // Display results if available
+                if (data.results && Array.isArray(data.results) && data.results.length > 0) {
+                  data.results.forEach(product => {
+                    const scoreText = product.score ? `${Math.round(product.score)}` : '';
+                    addMessage("bot", {
+                      name: product.name || 'Unnamed Product',
+                      price: product.price || '',
+                      category: product.category || '',
+                      description: product.description || '',
+                      image_url: product.image_url || '',
+                      score: scoreText
+                    }, true);
+                  });
+                } else if (!data.message) {
+                  addMessage("bot", "No matching products found.");
+                }
               }
             } else {
               throw new Error(data.error || "Failed to process your query");

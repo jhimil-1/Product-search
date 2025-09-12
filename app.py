@@ -794,6 +794,57 @@ def handle_product_question(question: str, session_id: str, collection_name: str
             count = vector_store.count_points(collection_name=collection_name)
             return {"message": f"There are {count} products in the catalog."}
         
+        # Check for price queries
+        price_indicators = ["price of", "cost of", "how much is", "what does the", "cost for", "what is the price of"]
+        if any(indicator in question_lower for indicator in price_indicators):
+            # Extract product name from question by removing price indicators and question marks
+            product_query = question
+            for indicator in price_indicators:
+                if indicator in question_lower:
+                    product_query = question[question_lower.find(indicator) + len(indicator):].strip(' .,?!')
+                    break
+            
+            logger.info(f"Processing price query for: '{product_query}'")
+            
+            # Clean up the query - remove any remaining question marks and extra spaces
+            product_query = product_query.replace('?', '').strip()
+            
+            # First try exact name match with the full query
+            exact_match = vector_store.search_with_name(
+                collection_name=collection_name,
+                product_name=product_query,
+                exact_match=True
+            )
+            
+            if exact_match:
+                formatted_results = format_product_results(exact_match, session_id)
+                if formatted_results:
+                    product = formatted_results[0]
+                    logger.info(f"Found exact match for '{product_query}': {product.get('name')}")
+                    return {
+                        "message": f"The price of {product.get('name', 'this item')} is {product.get('price', 'not available')}.",
+                        "results": [product],
+                        "exact_match": True
+                    }
+            
+            # For price queries, we only want exact matches to avoid confusion
+            # We don't want to show similar products when asking for a specific product price
+            
+            # If we get here, no exact matches were found
+            return {
+                "message": f"I couldn't find an exact match for '{product_query}'. Please try with the exact product name.",
+                "results": [],
+                "exact_match": False
+            }
+            
+            # If we get here, no matches were found
+            logger.warning(f"No matches found for price query: '{product_query}'")
+            return {
+                "message": f"I couldn't find a product matching '{product_query}' in our catalog.",
+                "results": [],
+                "exact_match": False
+            }
+        
         # Detect categories from the question for more specific searches
         detected_categories = detect_jewelry_category(question)
         
@@ -817,10 +868,34 @@ def handle_product_question(question: str, session_id: str, collection_name: str
                 return {
                     "message": f"Here are some {', '.join(detected_categories)} that might match your question:",
                     "results": formatted_results,
-                    "detected_categories": detected_categories
+                    "detected_categories": detected_categories,
+                    "exact_match": False
                 }
         
-        # If no results with category filter, try a general search
+        # Check if this is a query for a specific product (not a category or general question)
+        # If it's a specific product query, try to find an exact match first
+        specific_product_query = not detected_categories and not any(word in question_lower for word in ["what", "where", "when", "how", "why", "?"])
+        
+        if specific_product_query:
+            # Try exact name match first
+            exact_match = vector_store.search_with_name(
+                collection_name=collection_name,
+                product_name=question,
+                exact_match=True
+            )
+            
+            if exact_match:
+                formatted_results = format_product_results(exact_match, session_id)
+                if formatted_results:
+                    product = formatted_results[0]
+                    logger.info(f"Found exact match for '{question}': {product.get('name')}")
+                    return {
+                        "message": f"Here is the {product.get('name', 'product')} you asked for.",
+                        "results": [product],  # Only return the exact match
+                        "exact_match": True
+                    }
+        
+        # If no exact match or it's not a specific product query, try a general search
         results = vector_store.search(
             collection_name=collection_name,
             query_vector=question_embedding,
@@ -829,25 +904,39 @@ def handle_product_question(question: str, session_id: str, collection_name: str
         )
         
         if results:
-            formatted_results = format_product_results(results, session_id)
-            if formatted_results and len(formatted_results) > 0:
-                top_result = formatted_results[0]
-                answer = top_result.get('name', 'I found some products')
-                if top_result.get('description'):
-                    answer += f" - {top_result['description'][:100]}..."
-                
-                return {
-                    "message": answer,
-                    "results": formatted_results,
-                    "detected_categories": detected_categories or []
-                }
+            # For specific product queries, only return the top result
+            if specific_product_query:
+                formatted_results = format_product_results([results[0]], session_id)
+                if formatted_results and len(formatted_results) > 0:
+                    product = formatted_results[0]
+                    return {
+                        "message": f"Here is the closest match for '{question}'.",
+                        "results": [product],  # Only return the top match
+                        "exact_match": False
+                    }
+            else:
+                # For general queries, return multiple results
+                formatted_results = format_product_results(results, session_id)
+                if formatted_results and len(formatted_results) > 0:
+                    top_result = formatted_results[0]
+                    answer = top_result.get('name', 'I found some products')
+                    if top_result.get('description'):
+                        answer += f" - {top_result['description'][:100]}..."
+                    
+                    return {
+                        "message": answer,
+                        "results": formatted_results,
+                        "detected_categories": detected_categories or [],
+                        "exact_match": False
+                    }
         
         # Default response if no products found
         return {
             "message": "I couldn't find any products matching your question. " \
                       "Please try asking about specific products or categories.",
             "results": [],
-            "detected_categories": detected_categories or []
+            "detected_categories": detected_categories or [],
+            "exact_match": False
         }
         
     except Exception as e:
