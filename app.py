@@ -697,34 +697,405 @@ def query_text():
             
         collection_name = session_data['collection_name']
         
-        # Check if it's a question or search query
-        is_question = any(word in query.lower() for word in ["what", "where", "when", "how", "why", "?"])
+        # Enhanced query classification
+        query_type = classify_query(query)
         
-        if is_question:
+        if query_type == "price_query":
+            return handle_price_query(query, session_id, collection_name)
+        elif query_type == "specific_product":
+            return handle_specific_product_query(query, session_id, collection_name)
+        elif query_type == "question":
             return handle_product_question(query, session_id, collection_name)
-        else:
+        else:  # general_search
             return handle_product_search(query, session_id, collection_name)
             
     except Exception as e:
         logger.error(f"Error in query_text: {str(e)}", exc_info=True)
         return jsonify({"error": "An error occurred while processing your request"}), 500
 
+def classify_query(query):
+    """
+    Enhanced query classification with better price query detection
+    """
+    query_lower = query.lower().strip()
+    
+    # Enhanced price query patterns - more comprehensive
+    price_patterns = [
+        r'\b(?:tell me |what\'s |what is |show me )?(?:the )?price of\b',
+        r'\b(?:tell me |what\'s |what is )?(?:the )?cost of\b',
+        r'\bhow much (?:is|are|does|do)\b',
+        r'\bwhat (?:does|do) (?:the |this |these )?.*cost\b',
+        r'\bwhat (?:is|are) (?:the )?price(?:s)?\b',
+        r'\bhow much (?:for|is) (?:the |this |these )?\b',
+        r'\bcost for (?:the |this |these )?\b',
+        r'\bprice for (?:the |this |these )?\b'
+    ]
+    
+    # Check if it matches any price pattern
+    for pattern in price_patterns:
+        if re.search(pattern, query_lower):
+            logger.info(f"Query classified as price query using pattern: {pattern}")
+            return "price_query"
+    
+    # Simple price indicators (fallback)
+    simple_price_words = ['price', 'cost', 'expensive', 'cheap', 'money', 'dollar', 'rupee']
+    if any(word in query_lower for word in simple_price_words):
+        # Additional check to avoid false positives
+        if not any(word in query_lower for word in ['show', 'find', 'search', 'browse', 'all']):
+            logger.info(f"Query classified as price query using simple indicators")
+            return "price_query"
+    
+    # Question patterns
+    question_words = ["what", "where", "when", "how", "why", "which", "who"]
+    if any(query_lower.startswith(word) for word in question_words) or "?" in query:
+        return "question"
+    
+    # Specific product patterns (usually 2-4 words, specific items)
+    words = query_lower.split()
+    
+    if 2 <= len(words) <= 4:
+        # Look for specific product indicators
+        specific_indicators = [
+            r'\b(?:diamond|ruby|emerald|sapphire|pearl|gold|silver|platinum)\s+(?:stud|ring|necklace|bracelet|earring|pendant)\b',
+            r'\b(?:classic|vintage|modern|antique|designer)\s+(?:stud|ring|necklace|bracelet|earring|pendant)\b',
+            r'\b(?:stud|ring|necklace|bracelet|earring|pendant)\s+(?:set|pair|collection)\b'
+        ]
+        
+        for pattern in specific_indicators:
+            if re.search(pattern, query_lower):
+                return "specific_product"
+        
+        # If it's just a jewelry category + descriptor, treat as specific
+        categories = ['stud', 'studs', 'ring', 'rings', 'necklace', 'necklaces', 
+                     'bracelet', 'bracelets', 'earring', 'earrings', 'pendant', 'pendants']
+        
+        if any(cat in words for cat in categories):
+            return "specific_product"
+    
+    return "general_search"
+
+
+def handle_price_query(query, session_id, collection_name):
+    """Enhanced price query handler with better matching strategies"""
+    try:
+        # Extract product name from the price query
+        query_lower = query.lower().strip()
+        
+        # Remove price indicators to extract the product name
+        price_indicators = [
+            "tell me the price of", "what's the price of", "what is the price of",
+            "price of", "cost of", "how much is", "what does the", "cost for",
+            "how much does", "price for", "how much are", "what do the"
+        ]
+        
+        product_query = query
+        for indicator in price_indicators:
+            if indicator in query_lower:
+                # Find the position and extract everything after the indicator
+                pos = query_lower.find(indicator)
+                product_query = query[pos + len(indicator):].strip()
+                break
+        
+        # Clean up the extracted product name
+        product_query = product_query.replace('?', '').replace('the ', '').strip()
+        
+        logger.info(f"Price query - original: '{query}', extracted: '{product_query}'")
+        
+        # Multiple search strategies for better matching
+        
+        # Strategy 1: Direct text search with multiple variations
+        search_variations = [
+            product_query,
+            product_query.lower(),
+            product_query.title(),
+            # Try with common word variations
+            product_query.replace('earring', 'earrings'),
+            product_query.replace('earrings', 'earring'),
+            product_query.replace('ring', 'rings'),
+            product_query.replace('rings', 'ring'),
+            product_query.replace('necklace', 'necklaces'),
+            product_query.replace('necklaces', 'necklace')
+        ]
+        
+        # Remove duplicates while preserving order
+        seen = set()
+        search_variations = [x for x in search_variations if not (x in seen or seen.add(x))]
+        
+        best_match = None
+        best_score = 0.0
+        
+        for variation in search_variations:
+            try:
+                logger.info(f"Trying search variation: '{variation}'")
+                
+                # Generate embedding for this variation
+                query_embedding = embed_text(variation)
+                if not query_embedding:
+                    continue
+                
+                # Search with a lower threshold to cast a wider net
+                results = vector_store.search(
+                    collection_name=collection_name,
+                    query_vector=query_embedding,
+                    vector_name="text",  # Specify the vector name
+                    top_k=30,  # Get more results for better matching
+                    score_threshold=0.1  # Very low threshold
+                )
+                
+                if results:
+                    logger.info(f"Found {len(results)} results for variation '{variation}'")
+                    
+                    # Check for exact matches first
+                    for result in results:
+                        payload = getattr(result, 'payload', {}) or {}
+                        result_name = str(payload.get('name', '')).strip()
+                        result_score = float(getattr(result, 'score', 0.0))
+                        
+                        # Multiple exact match strategies
+                        exact_match_found = False
+                        
+                        # Strategy A: Exact case-insensitive match
+                        if result_name.lower() == variation.lower():
+                            logger.info(f"Exact match found: '{result_name}' matches '{variation}'")
+                            exact_match_found = True
+                        
+                        # Strategy B: Check if the search term is contained in the product name
+                        elif variation.lower() in result_name.lower():
+                            # Additional validation: ensure it's not just a partial word match
+                            words_in_query = set(variation.lower().split())
+                            words_in_result = set(result_name.lower().split())
+                            
+                            # Check if all words from query are in the result
+                            if words_in_query.issubset(words_in_result):
+                                logger.info(f"Subset match found: '{result_name}' contains all words from '{variation}'")
+                                exact_match_found = True
+                        
+                        # Strategy C: Check if result name is contained in search term (for longer queries)
+                        elif result_name.lower() in variation.lower():
+                            logger.info(f"Reverse subset match found: '{variation}' contains '{result_name}'")
+                            exact_match_found = True
+                        
+                        if exact_match_found:
+                            if result_score > best_score or best_match is None:
+                                best_match = result
+                                best_score = result_score
+                                logger.info(f"New best match: '{result_name}' with score {result_score}")
+                
+                # If we found a good match, no need to try more variations
+                if best_match and best_score > 0.8:
+                    break
+                    
+            except Exception as e:
+                logger.warning(f"Error searching with variation '{variation}': {str(e)}")
+                continue
+        
+        # Strategy 2: If no exact match found, try fuzzy matching with high similarity
+        if not best_match:
+            logger.info("No exact match found, trying high similarity matching")
+            
+            query_embedding = embed_text(product_query)
+            if query_embedding:
+                results = vector_store.search(
+                    collection_name=collection_name,
+                    query_vector=query_embedding,
+                    vector_name="text",  # Specify the vector name
+                    top_k=20,
+                    score_threshold=0.2
+                )
+                
+                if results:
+                    # Look for very high similarity matches (85%+)
+                    for result in results:
+                        score = float(getattr(result, 'score', 0.0))
+                        if score >= 0.85:
+                            payload = getattr(result, 'payload', {}) or {}
+                            result_name = str(payload.get('name', '')).strip()
+                            logger.info(f"High similarity match: '{result_name}' with score {score}")
+                            
+                            if score > best_score or best_match is None:
+                                best_match = result
+                                best_score = score
+        
+        # Return the best match if found
+        if best_match:
+            formatted_result = format_product_results([best_match], session_id)
+            if formatted_result:
+                product = formatted_result[0]
+                product_name = product.get('name', 'this item')
+                product_price = product.get('price', 'not available')
+                
+                logger.info(f"Returning price for '{product_name}': {product_price}")
+                
+                return jsonify({
+                    "message": f"The price of {product_name} is {product_price}.",
+                    "results": [product],
+                    "exact_match": best_score > 0.8,
+                    "query_type": "price",
+                    "confidence_score": round(best_score * 100, 1)
+                })
+        
+        # No match found - provide helpful suggestion
+        logger.warning(f"No match found for price query: '{product_query}'")
+        
+        # Try to suggest similar products by doing a broader search
+        query_embedding = embed_text(product_query)
+        if query_embedding:
+            similar_results = vector_store.search(
+                collection_name=collection_name,
+                query_vector=query_embedding,
+                vector_name="text",  # Specify the vector name
+                top_k=3,
+                score_threshold=0.3
+            )
+            
+            if similar_results:
+                formatted_results = format_product_results(similar_results, session_id)
+                if formatted_results:
+                    suggestion_names = [p.get('name', '') for p in formatted_results[:2]]
+                    suggestions = ', '.join([f"'{name}'" for name in suggestion_names if name])
+                    
+                    return jsonify({
+                        "message": f"I couldn't find the exact price for '{product_query}'. Did you mean: {suggestions}? Please use the exact product name.",
+                        "results": formatted_results[:2],  # Show top 2 suggestions
+                        "exact_match": False,
+                        "query_type": "price",
+                        "suggestions": True
+                    })
+        
+        return jsonify({
+            "message": f"I couldn't find '{product_query}' in the catalog. Please check the spelling or browse the products to find the exact name.",
+            "results": [],
+            "exact_match": False,
+            "query_type": "price"
+        })
+        
+    except Exception as e:
+        logger.error(f"Error in handle_price_query: {str(e)}", exc_info=True)
+        return jsonify({"error": "An error occurred while processing your price query"}), 500
+
+
+def handle_specific_product_query(query, session_id, collection_name):
+    """Handle specific product queries with exact matching priority"""
+    try:
+        logger.info(f"Specific product query: '{query}'")
+        
+        # Generate embedding for the query
+        query_embedding = embed_text(query)
+        if not query_embedding:
+            return jsonify({"error": "Failed to process your query"}), 500
+        
+        # Get more results for better exact matching
+        results = vector_store.search(
+            collection_name=collection_name,
+            query_vector=query_embedding,
+            top_k=25,
+            score_threshold=0.3
+        )
+        
+        if not results:
+            return jsonify({
+                "message": f"No products found matching '{query}'. Try browsing by category or using different keywords.",
+                "results": [],
+                "exact_match": False,
+                "query_type": "specific_product"
+            })
+        
+        query_lower = query.lower().strip()
+        best_matches = []
+        
+        # Stage 1: Look for exact name matches
+        for result in results:
+            payload = getattr(result, 'payload', {}) or {}
+            result_name = str(payload.get('name', '')).lower().strip()
+            
+            if result_name == query_lower:
+                best_matches.append(result)
+                break  # Found exact match, no need to continue
+        
+        # Stage 2: Look for very high similarity matches if no exact match
+        if not best_matches:
+            for result in results:
+                if hasattr(result, 'score') and result.score >= 0.85:
+                    best_matches.append(result)
+                    if len(best_matches) >= 3:  # Limit to top 3 high-confidence matches
+                        break
+        
+        # Stage 3: If still no good matches, check for partial name matches
+        if not best_matches:
+            query_words = set(query_lower.split())
+            for result in results:
+                payload = getattr(result, 'payload', {}) or {}
+                result_name = str(payload.get('name', '')).lower().strip()
+                result_words = set(result_name.split())
+                
+                # Check if all query words are in the result name
+                if query_words.issubset(result_words) or result_words.issubset(query_words):
+                    best_matches.append(result)
+                    if len(best_matches) >= 2:  # Limit for partial matches
+                        break
+        
+        # Stage 4: Last resort - category matching with high scores
+        if not best_matches:
+            detected_categories = detect_jewelry_category(query)
+            if detected_categories:
+                category = detected_categories[0].lower()
+                for result in results[:10]:  # Only check top 10
+                    payload = getattr(result, 'payload', {}) or {}
+                    result_category = str(payload.get('category', '')).lower().strip()
+                    
+                    if category in result_category and hasattr(result, 'score') and result.score >= 0.6:
+                        best_matches.append(result)
+                        if len(best_matches) >= 5:  # More results for category fallback
+                            break
+        
+        if best_matches:
+            formatted_results = format_product_results(best_matches, session_id)
+            
+            if len(formatted_results) == 1:
+                # Single result - likely what they were looking for
+                product = formatted_results[0]
+                return jsonify({
+                    "message": f"Found: {product.get('name', 'Product')} - {product.get('price', 'Price not available')}",
+                    "results": formatted_results,
+                    "exact_match": True,
+                    "query_type": "specific_product"
+                })
+            else:
+                # Multiple results - show them but indicate it's a specific search
+                return jsonify({
+                    "message": f"Found {len(formatted_results)} products matching '{query}':",
+                    "results": formatted_results,
+                    "exact_match": False,
+                    "query_type": "specific_product"
+                })
+        
+        return jsonify({
+            "message": f"No products found matching '{query}'. Try different keywords or browse by category.",
+            "results": [],
+            "exact_match": False,
+            "query_type": "specific_product"
+        })
+        
+    except Exception as e:
+        logger.error(f"Error in handle_specific_product_query: {str(e)}", exc_info=True)
+        return jsonify({"error": "An error occurred while processing your query"}), 500
+
+
 def handle_product_search(query: str, session_id: str, collection_name: str):
-    """Enhanced product search with strict category filtering and improved similarity"""
+    """Enhanced product search for general/category searches"""
     try:
         # Verify session exists
         session_data = sessions_col.find_one({"_id": session_id})
         if not session_data or 'collection_name' not in session_data:
             return jsonify({"error": "Session not found"}), 404
         
-        # Detect categories from the query with improved accuracy
+        # Detect categories from the query
         detected_categories = detect_jewelry_category(query)
         
-        logger.info(f"Search query: '{query}' - Detected categories: {detected_categories}")
+        logger.info(f"General search query: '{query}' - Detected categories: {detected_categories}")
         
         # Create enhanced query for embedding with category emphasis
         if detected_categories:
-            # Heavily weight the category in the query for better semantic matching
             primary_category = detected_categories[0]
             enhanced_query = f"{primary_category} {primary_category} jewelry {query}"
         else:
@@ -737,54 +1108,19 @@ def handle_product_search(query: str, session_id: str, collection_name: str):
         
         results = None
         
-        # Strategy 1: Strict category filtering with high threshold
+        # Strategy: Category filtering with reasonable limits
         if detected_categories:
-            logger.info(f"Using strict category filtering for: {detected_categories}")
+            logger.info(f"Using category filtering for: {detected_categories}")
             results = vector_store.search_with_category_filter(
                 collection_name=collection_name,
                 query_vector=query_embedding,
                 categories=detected_categories,
-                top_k=20,  # Get more results for better filtering
-                score_threshold=0.4  # Lower threshold to get more candidates
+                top_k=15,
+                score_threshold=0.4
             )
             
             if results:
-                # Apply strict post-filtering to ensure category precision
-                filtered_results = []
-                for result in results:
-                    payload = getattr(result, 'payload', {}) or {}
-                    result_category = str(payload.get('category', '')).lower().strip()
-                    
-                    # Skip results without category
-                    if not result_category:
-                        continue
-                    
-                    # Check for exact category match (case-insensitive)
-                    primary_detected = detected_categories[0].lower()
-                    result_categories = [cat.strip().lower() for cat in result_category.split(',')]
-                    
-                    # Only include if there's an exact match with the primary category
-                    if primary_detected in result_categories:
-                        filtered_results.append(result)
-                        if len(filtered_results) >= 10:
-                            break
-                
-                results = filtered_results
-                logger.info(f"After strict filtering: {len(results)} results")
-        
-        # Strategy 2: If no category detected or no results, use general search with post-filtering
-        if not results:
-            logger.info("Using general search approach")
-            results = vector_store.search(
-                collection_name=collection_name,
-                query_vector=query_embedding,
-                top_k=15,
-                score_threshold=0.5  # Higher threshold for general search
-            )
-            
-            # If we detected categories but general search returned results, 
-            # still apply category filtering
-            if results and detected_categories:
+                # Apply strict post-filtering
                 filtered_results = []
                 primary_detected = detected_categories[0].lower()
                 
@@ -796,16 +1132,27 @@ def handle_product_search(query: str, session_id: str, collection_name: str):
                         result_categories = [cat.strip().lower() for cat in result_category.split(',')]
                         if primary_detected in result_categories:
                             filtered_results.append(result)
-                            if len(filtered_results) >= 8:
+                            if len(filtered_results) >= 8:  # Reasonable limit
                                 break
                 
-                results = filtered_results if filtered_results else results[:5]
+                results = filtered_results
+                logger.info(f"After category filtering: {len(results)} results")
+        
+        # Fallback to general search
+        if not results:
+            logger.info("Using general search approach")
+            results = vector_store.search(
+                collection_name=collection_name,
+                query_vector=query_embedding,
+                top_k=10,
+                score_threshold=0.5
+            )
         
         # Format and return results
         if results:
             formatted_results = format_product_results(results, session_id)
             
-            # Sort by relevance score (higher is better)
+            # Sort by relevance score
             formatted_results.sort(key=lambda x: x.get('score', 0), reverse=True)
             
             # Create appropriate message
@@ -815,24 +1162,23 @@ def handle_product_search(query: str, session_id: str, collection_name: str):
             else:
                 message = f"Found {len(formatted_results)} product{'s' if len(formatted_results) != 1 else ''} matching your search:"
             
-            logger.info(f"Returning {len(formatted_results)} results for query: '{query}'")
             return jsonify({
                 "results": formatted_results,
                 "message": message,
-                "detected_categories": detected_categories
+                "detected_categories": detected_categories,
+                "query_type": "general_search"
             })
         else:
-            # No results found
             if detected_categories:
-                message = f"No {detected_categories[0].lower()}s found matching your search. Try different keywords or browse all products."
+                message = f"No {detected_categories[0].lower()}s found matching your search. Try different keywords."
             else:
-                message = "No products found matching your search. Try different keywords or browse all products."
+                message = "No products found matching your search. Try different keywords."
                 
-            logger.info(f"No results found for query: '{query}'")
             return jsonify({
                 "message": message, 
                 "results": [],
-                "detected_categories": detected_categories
+                "detected_categories": detected_categories,
+                "query_type": "general_search"
             })
             
     except Exception as e:
