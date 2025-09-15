@@ -1084,19 +1084,36 @@ class VectorStore:
                 
             logger.info(f"Searching with category filter for: {original_categories}")
             
-            # First get more results than needed for better filtering
+            # First check if we have any products in the collection
+            collection_info = self.client.get_collection(collection_name=collection_name)
+            if not collection_info.points_count or collection_info.points_count == 0:
+                logger.warning(f"Collection {collection_name} is empty")
+                return []
+                
+            # Get more results than needed for better filtering
+            logger.info(f"Searching for {top_k} results with categories: {original_categories}")
             results = self.client.search(
                 collection_name=collection_name,
                 query_vector=(vector_name, query_vector),
-                limit=top_k * 3,  # Get more results for filtering
-                score_threshold=score_threshold,
+                limit=min(50, top_k * 5),  # Get more results for filtering
+                score_threshold=max(0.1, score_threshold - 0.2),  # Be more lenient with score threshold
                 with_payload=True,
                 with_vectors=False
             )
             
+            if not results:
+                logger.warning("No results found in initial search")
+                return []
+                
             # Filter by category
             filtered_results = []
             seen_ids = set()
+            
+            # Log first few results for debugging
+            logger.info(f"Found {len(results)} initial results, filtering by category")
+            for i, result in enumerate(results[:min(5, len(results))], 1):
+                payload = getattr(result, 'payload', {}) or {}
+                logger.info(f"  {i}. {payload.get('name', 'Unnamed')} (score: {getattr(result, 'score', 0):.3f}, category: {payload.get('category', 'N/A')})")
             
             for result in results:
                 payload = getattr(result, 'payload', {}) or {}
@@ -1107,7 +1124,7 @@ class VectorStore:
                     continue
                     
                 seen_ids.add(result_id)
-                result_category = str(payload.get('category', '')).lower()
+                result_category = str(payload.get('category', '')).lower().strip()
                 
                 # Skip if no category is available
                 if not result_category:
@@ -1117,16 +1134,25 @@ class VectorStore:
                 # Check if result matches any of the target categories
                 is_match = False
                 for target_category in original_categories:
-                    target_lower = target_category.lower()
+                    target_lower = target_category.lower().strip()
+                    
+                    # More lenient matching
                     if (target_lower in result_category or 
+                        result_category in target_lower or
                         f"{target_lower}s" in result_category or
-                        result_category == target_lower[:-1]):  # Handles singular/plural
+                        result_category == f"{target_lower}s" or
+                        result_category == target_lower[:-1] or  # Handles singular/plural
+                        target_lower == result_category[:-1] or  # Handles plural/singular
+                        any(term in result_category for term in target_lower.split()) or
+                        any(term in target_lower for term in result_category.split())):
+                        
                         is_match = True
+                        logger.debug(f"Matched category: {result_category} to target: {target_lower}")
                         break
                         
                 if is_match:
                     filtered_results.append(result)
-                    logger.debug(f"Added product to results: {payload.get('name', 'Unnamed')} with category: {result_category}")
+                    logger.info(f"Added product to results: {payload.get('name', 'Unnamed')} with category: {result_category}")
                     if len(filtered_results) >= top_k:  # Stop once we have enough results
                         break
             
@@ -1139,23 +1165,56 @@ class VectorStore:
                 for i, result in enumerate(filtered_results[:min(3, len(filtered_results))], 1):
                     payload = getattr(result, 'payload', {}) or {}
                     logger.info(f"  {i}. {payload.get('name', 'Unnamed')} (score: {getattr(result, 'score', 0):.3f}, category: {payload.get('category', 'N/A')})")
-            else:
-                logger.warning("No matching results found after filtering")
+                return filtered_results
                 
-            return filtered_results
+            # If no results found, try a more lenient search
+            logger.warning("No matching results found after filtering, trying more lenient search")
+            
+            # Try with a lower score threshold and broader matching
+            results = self.client.search(
+                collection_name=collection_name,
+                query_vector=(vector_name, query_vector),
+                limit=min(100, top_k * 10),  # Get even more results
+                score_threshold=0.0,  # No score threshold
+                with_payload=True,
+                with_vectors=False
+            )
+            
+            # Try to find any product that has a category field
+            if results:
+                logger.info(f"Found {len(results)} results in lenient search")
+                for result in results:
+                    payload = getattr(result, 'payload', {}) or {}
+                    result_category = str(payload.get('category', '')).lower().strip()
+                    if result_category:
+                        logger.info(f"Found product with category: {payload.get('name', 'Unnamed')} (category: {result_category})")
+                        filtered_results.append(result)
+                        if len(filtered_results) >= top_k:
+                            break
+            
+            if not filtered_results and results:
+                # If still no results, just return the top results regardless of category
+                logger.warning("No results with categories found, returning top results")
+                return results[:top_k]
+                
+            return filtered_results[:top_k]
             
         except Exception as e:
             logger.error(f"Error in category-filtered search: {str(e)}", exc_info=True)
             # Fallback to regular search without category filter
             try:
                 logger.info("Falling back to regular search without category filter")
-                return self.search(
+                # Try to get any products at all
+                results = self.client.scroll(
                     collection_name=collection_name,
-                    query_vector=query_vector,
-                    vector_name=vector_name,
-                    top_k=top_k,
-                    score_threshold=max(0.05, score_threshold - 0.15)  # Be more lenient
+                    limit=top_k,
+                    with_payload=True,
+                    with_vectors=False
                 )
+                if results and len(results) > 0 and len(results[0]) > 0:
+                    logger.info(f"Found {len(results[0])} products in fallback search")
+                    return results[0][:top_k]
+                return []
             except Exception as fallback_error:
-                logger.error(f"Fallback search also failed: {str(fallback_error)}")
+                logger.error(f"Fallback search also failed: {str(fallback_error)}", exc_info=True)
                 return []
