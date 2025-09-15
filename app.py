@@ -458,6 +458,60 @@ def save_image_from_url(url, session_id):
         return None
 
 # ---------------------------
+# Debug Endpoint
+# ---------------------------
+@app.route("/debug/collection/<session_id>", methods=["GET"])
+@login_required
+def debug_collection(session_id):
+    """Debug endpoint to check collection contents"""
+    try:
+        session_data = sessions_col.find_one({"_id": session_id})
+        if not session_data:
+            return jsonify({"error": "Session not found"}), 404
+            
+        collection_name = session_data['collection_name']
+        
+        # Get collection info
+        try:
+            collection_info = vector_store.client.get_collection(collection_name)
+            
+            # Get a few sample points
+            sample_points = vector_store.client.scroll(
+                collection_name=collection_name,
+                limit=5,
+                with_payload=True,
+                with_vectors=False
+            )
+            
+            debug_info = {
+                "collection_name": collection_name,
+                "collection_info": {
+                    "points_count": collection_info.points_count,
+                    "vectors_count": collection_info.vectors_count if hasattr(collection_info, 'vectors_count') else "N/A"
+                },
+                "sample_products": []
+            }
+            
+            if sample_points and len(sample_points[0]) > 0:
+                for point in sample_points[0]:
+                    payload = getattr(point, 'payload', {}) or {}
+                    debug_info["sample_products"].append({
+                        "id": getattr(point, 'id', 'N/A'),
+                        "name": payload.get('name', 'N/A'),
+                        "category": payload.get('category', 'N/A'),
+                        "price": payload.get('price', 'N/A')
+                    })
+            
+            return jsonify(debug_info)
+            
+        except Exception as e:
+            return jsonify({"error": f"Failed to get collection info: {str(e)}"}), 500
+            
+    except Exception as e:
+        logger.error(f"Debug endpoint error: {str(e)}")
+        return jsonify({"error": str(e)}), 500
+
+# ---------------------------
 # Upload products
 # ---------------------------
 @app.route("/upload_products/<session_id>", methods=["POST"])
@@ -684,12 +738,17 @@ def upload_products(session_id):
 def query_text():
     try:
         data = request.get_json()
+        if not data:
+            return jsonify({"error": "No JSON data received"}), 400
+            
         query = data.get('query')
         session_id = data.get('session_id')
         
         if not query or not session_id:
             return jsonify({"error": "Missing query or session_id"}), 400
             
+        logger.info(f"Received text query: '{query}' for session: {session_id}")
+        
         # Get session data
         session_data = sessions_col.find_one({"_id": session_id})
         if not session_data or 'collection_name' not in session_data:
@@ -699,6 +758,7 @@ def query_text():
         
         # Enhanced query classification
         query_type = classify_query(query)
+        logger.info(f"Query classified as: {query_type}")
         
         if query_type == "price_query":
             return handle_price_query(query, session_id, collection_name)
@@ -710,14 +770,30 @@ def query_text():
             return handle_product_search(query, session_id, collection_name)
             
     except Exception as e:
-        logger.error(f"Error in query_text: {str(e)}", exc_info=True)
-        return jsonify({"error": "An error occurred while processing your request"}), 500
+        logger.error(f"Error in query_text endpoint: {str(e)}", exc_info=True)
+        return jsonify({
+            "error": "An error occurred while processing your request",
+            "details": str(e)
+        }), 500
+
+@app.route('/debug', methods=['GET'])
+def debug_endpoint():
+    try:
+        # Add debug logic here
+        return jsonify({"message": "Debug endpoint reached successfully"}), 200
+    except Exception as e:
+        logger.error(f"Error in debug endpoint: {str(e)}", exc_info=True)
+        return jsonify({"error": f"An error occurred: {str(e)}"}), 500
 
 def classify_query(query):
     """
-    Enhanced query classification with better price query detection
+    Enhanced query classification with better handling of different query types
     """
     query_lower = query.lower().strip()
+    
+    # Handle browsing queries first
+    if any(word in query_lower for word in ['show me', 'display', 'list', 'browse', 'all']):
+        return "general_search"
     
     # Enhanced price query patterns - more comprehensive
     price_patterns = [
@@ -1082,108 +1158,282 @@ def handle_specific_product_query(query, session_id, collection_name):
 
 
 def handle_product_search(query: str, session_id: str, collection_name: str):
-    """Enhanced product search for general/category searches"""
+    """
+    Fixed product search with comprehensive debugging and error handling
+    """
     try:
         # Verify session exists
         session_data = sessions_col.find_one({"_id": session_id})
         if not session_data or 'collection_name' not in session_data:
+            logger.error(f"Session not found or invalid: {session_id}")
             return jsonify({"error": "Session not found"}), 404
         
-        # Detect categories from the query
-        detected_categories = detect_jewelry_category(query)
+        logger.info(f"Processing search query: '{query}' for session: {session_id}")
         
-        logger.info(f"General search query: '{query}' - Detected categories: {detected_categories}")
+        # Check if collection exists and has points
+        try:
+            collection_info = vector_store.client.get_collection(collection_name)
+            if collection_info.points_count == 0:
+                logger.warning(f"Collection {collection_name} is empty")
+                return jsonify({
+                    "message": "No products found in your catalog. Please upload products first.",
+                    "results": [],
+                    "success": False
+                })
+        except Exception as e:
+            logger.error(f"Error checking collection {collection_name}: {str(e)}")
+            return jsonify({
+                "error": f"Collection error: {str(e)}",
+                "success": False
+            }), 500
         
-        # Create enhanced query for embedding with category emphasis
+        # Clean and preprocess the query
+        original_query = query.strip()
+        clean_query = query.lower().strip()
+        
+        # Define jewelry categories with comprehensive matching terms
+        jewelry_categories = {
+            'necklace': ['necklace', 'necklaces', 'pendant', 'pendants', 'choker', 'chokers', 'locket', 'lockets', 'chain', 'chains'],
+            'ring': ['ring', 'rings', 'band', 'bands', 'wedding band', 'engagement ring', 'wedding ring', 'cocktail ring'],
+            'earring': ['earring', 'earrings', 'stud', 'studs', 'hoop', 'hoops', 'dangle', 'dangles', 'ear piece'],
+            'bracelet': ['bracelet', 'bracelets', 'bangle', 'bangles', 'cuff', 'cuffs', 'chain bracelet', 'charm bracelet'],
+            'watch': ['watch', 'watches', 'wristwatch', 'timepiece', 'wrist watch'],
+            'anklet': ['anklet', 'anklets', 'ankle bracelet', 'foot jewelry'],
+            'brooch': ['brooch', 'brooches', 'pin', 'pins', 'lapel pin']
+        }
+        
+        # Common words to remove from search terms
+        stop_words = {
+            'show', 'me', 'find', 'search', 'look', 'for', 'all', 'the', 'a', 'an', 'any',
+            'some', 'that', 'this', 'these', 'those', 'with', 'in', 'on', 'at', 'by',
+            'to', 'from', 'of', 'and', 'or', 'but', 'is', 'are', 'was', 'were', 'be',
+            'have', 'has', 'had', 'do', 'does', 'did', 'can', 'could', 'would', 'should',
+            'will', 'shall', 'may', 'might', 'must', 'about', 'like', 'as', 'if', 'then',
+            'than', 'just', 'only', 'also', 'even', 'very', 'too', 'so', 'such', 'more',
+            'most', 'less', 'least', 'many', 'much', 'few', 'several', 'both', 'each',
+            'every', 'either', 'neither', 'any', 'all', 'some', 'no', 'none', 'not',
+            'other', 'another', 'same', 'different', 'similar'
+        }
+        
+        # Initialize variables
+        detected_categories = []
+        search_terms = []
+        is_browsing = any(word in clean_query for word in ['show', 'display', 'list', 'browse'])
+        
+        # Extract categories from query - more flexible matching
+        query_words = clean_query.split()
+        
+        # First check for exact matches in the query
+        for category, terms in jewelry_categories.items():
+            # Check if any of the category terms are in the query
+            matched_terms = [term for term in terms if term in clean_query]
+            if matched_terms:
+                if category not in detected_categories:  # Avoid duplicates
+                    detected_categories.append(category)
+                    logger.info(f"Matched category '{category}' with terms: {matched_terms}")
+        
+        logger.info(f"Detected categories: {detected_categories}")
+        
+        # Extract search terms (non-category, non-stop words)
+        search_terms = [
+            word for word in query_words 
+            if word not in stop_words and 
+            not any(word in terms for terms in jewelry_categories.values())
+        ]
+        
+        # Build the enhanced query for embedding
         if detected_categories:
+            # Use the most specific category first
             primary_category = detected_categories[0]
-            enhanced_query = f"{primary_category} {primary_category} jewelry {query}"
+            
+            if search_terms:
+                # If we have additional search terms, include them
+                enhanced_query = f"{primary_category} {' '.join(search_terms)}"
+            else:
+                # For pure category browsing, just use the category name
+                enhanced_query = primary_category
+                
+            logger.info(f"Searching with category context: {enhanced_query}")
         else:
-            enhanced_query = f"jewelry {query}"
+            # No specific category detected, use the original query
+            enhanced_query = ' '.join([word for word in query_words if word not in stop_words]) or original_query
+            logger.info(f"No specific category detected, using query: {enhanced_query}")
         
         # Generate embedding for the search query
         query_embedding = embed_text(enhanced_query)
         if not query_embedding:
+            logger.error("Failed to generate embedding for query")
             return jsonify({"error": "Failed to process search query"}), 500
         
-        results = None
+        # Determine search strategy based on query type
+        results = []
         
-        # Strategy: Category filtering with reasonable limits
+        # Strategy 1: Category-based search if categories were detected
         if detected_categories:
-            logger.info(f"Using category filtering for: {detected_categories}")
-            results = vector_store.search_with_category_filter(
-                collection_name=collection_name,
-                query_vector=query_embedding,
-                categories=detected_categories,
-                top_k=15,
-                score_threshold=0.4
-            )
+            primary_category = detected_categories[0]
+            logger.info(f"Performing category-based search for: {primary_category}")
             
-            if results:
-                # Apply strict post-filtering
-                filtered_results = []
-                primary_detected = detected_categories[0].lower()
+            # Use direct client search with named vectors
+            try:
+                results = vector_store.client.search(
+                    collection_name=collection_name,
+                    query_vector=("text", query_embedding),  # Use tuple format for named vector
+                    limit=20,
+                    score_threshold=0.2,  # Lower threshold for broader results
+                    with_payload=True,
+                    with_vectors=False
+                )
                 
-                for result in results:
-                    payload = getattr(result, 'payload', {}) or {}
-                    result_category = str(payload.get('category', '')).lower().strip()
+                if results:
+                    logger.info(f"Initial search returned {len(results)} results")
                     
-                    if result_category:
-                        result_categories = [cat.strip().lower() for cat in result_category.split(',')]
-                        if primary_detected in result_categories:
-                            filtered_results.append(result)
-                            if len(filtered_results) >= 8:  # Reasonable limit
-                                break
+                    # Filter results by category on the client side for better control
+                    category_filtered_results = []
+                    for result in results:
+                        payload = getattr(result, 'payload', {}) or {}
+                        result_category = str(payload.get('category', '')).lower()
+                        
+                        # Check if the result matches our target category
+                        if (primary_category in result_category or 
+                            f"{primary_category}s" in result_category or
+                            any(term in result_category for term in jewelry_categories.get(primary_category, []))):
+                            category_filtered_results.append(result)
+                    
+                    if category_filtered_results:
+                        results = category_filtered_results[:15]  # Limit to 15 results
+                        logger.info(f"Found {len(results)} category-filtered results")
+                    else:
+                        logger.info("No results matched the category filter")
+                        results = []
                 
-                results = filtered_results
-                logger.info(f"After category filtering: {len(results)} results")
+            except Exception as e:
+                logger.error(f"Error in category search: {str(e)}", exc_info=True)
+                results = []
+            
+            # Strategy 2: If no category-filtered results, try broader search
+            if not results:
+                logger.info(f"Trying broader search for {primary_category}")
+                
+                # Try searching with just the category name
+                category_embedding = embed_text(primary_category)
+                if category_embedding:
+                    try:
+                        broader_results = vector_store.search(
+                            collection_name=collection_name,
+                            query_vector=category_embedding,
+                            vector_name="text",
+                            top_k=20,
+                            score_threshold=0.1
+                        )
+                        
+                        if broader_results:
+                            # Filter for category matches
+                            filtered_results = []
+                            for result in broader_results:
+                                payload = getattr(result, 'payload', {}) or {}
+                                result_category = str(payload.get('category', '')).lower()
+                                result_name = str(payload.get('name', '')).lower()
+                                
+                                # More lenient matching - check category OR name
+                                if (primary_category in result_category or 
+                                    f"{primary_category}s" in result_category or
+                                    primary_category in result_name or
+                                    f"{primary_category}s" in result_name):
+                                    filtered_results.append(result)
+                            
+                            if filtered_results:
+                                results = filtered_results[:15]
+                                logger.info(f"Broader search found {len(results)} results")
+                    
+                    except Exception as e:
+                        logger.error(f"Error in broader search: {str(e)}", exc_info=True)
         
-        # Fallback to general search
-        if not results:
-            logger.info("Using general search approach")
-            results = vector_store.search(
-                collection_name=collection_name,
-                query_vector=query_embedding,
-                top_k=10,
-                score_threshold=0.5
-            )
+        # Strategy 3: General search for non-category queries
+        else:
+            logger.info("Performing general search")
+            try:
+                results = vector_store.client.search(
+                    collection_name=collection_name,
+                    query_vector=("text", query_embedding),  # Use tuple format for named vector
+                    limit=15,
+                    score_threshold=0.2,
+                    with_payload=True,
+                    with_vectors=False
+                )
+                logger.info(f"General search returned {len(results) if results else 0} results")
+            except Exception as e:
+                logger.error(f"Error in general search: {str(e)}", exc_info=True)
+                results = []
         
-        # Format and return results
+                logger.error(f"Error in fallback search: {str(e)}", exc_info=True)
+                results = []
+        
+        # Format the results for the response
         if results:
             formatted_results = format_product_results(results, session_id)
             
-            # Sort by relevance score
-            formatted_results.sort(key=lambda x: x.get('score', 0), reverse=True)
-            
-            # Create appropriate message
+            # Determine the response message based on the query type
             if detected_categories:
-                category_name = detected_categories[0].title()
-                message = f"Found {len(formatted_results)} {category_name.lower()}{'s' if len(formatted_results) != 1 else ''} matching your search:"
+                primary_category = detected_categories[0].title()
+                if is_browsing:
+                    message = f"Here are {len(formatted_results)} {primary_category}s from our collection:"
+                else:
+                    if len(formatted_results) == 1:
+                        message = f"Found 1 {primary_category} matching your search:"
+                    else:
+                        message = f"Found {len(formatted_results)} {primary_category}s matching your search:"
             else:
-                message = f"Found {len(formatted_results)} product{'s' if len(formatted_results) != 1 else ''} matching your search:"
+                if len(formatted_results) == 1:
+                    message = "Found 1 product matching your search:"
+                else:
+                    message = f"Found {len(formatted_results)} products matching your search:"
+            
+            logger.info(f"Returning {len(formatted_results)} results for query: '{query}'")
             
             return jsonify({
                 "results": formatted_results,
                 "message": message,
-                "detected_categories": detected_categories,
-                "query_type": "general_search"
+                "detected_categories": detected_categories or [],
+                "query_type": "product_search",
+                "is_browsing": is_browsing,
+                "success": True
             })
+        
+        # No results found
+        logger.warning(f"No results found for query: '{query}'")
+        
+        # Provide helpful suggestions
+        suggestions = []
+        if detected_categories:
+            primary_category = detected_categories[0]
+            suggestions = [
+                f"Make sure you have uploaded {primary_category} products to your catalog",
+                f"Try searching for different {primary_category} styles",
+                "Check if your products are properly categorized",
+                "Verify your session has products uploaded"
+            ]
         else:
-            if detected_categories:
-                message = f"No {detected_categories[0].lower()}s found matching your search. Try different keywords."
-            else:
-                message = "No products found matching your search. Try different keywords."
-                
-            return jsonify({
-                "message": message, 
-                "results": [],
-                "detected_categories": detected_categories,
-                "query_type": "general_search"
-            })
-            
+            suggestions = [
+                "Make sure you have uploaded products to your catalog",
+                "Try different search terms",
+                "Browse by category (e.g., necklaces, rings, earrings)",
+                "Check your spelling"
+            ]
+        
+        return jsonify({
+            "message": "We couldn't find any products matching your search.",
+            "suggestions": suggestions,
+            "results": [],
+            "success": False
+        })
+        
     except Exception as e:
         logger.error(f"Error in handle_product_search: {str(e)}", exc_info=True)
-        return jsonify({"error": "An error occurred while processing your request"}), 500
+        return jsonify({
+            "error": "An error occurred while processing your search",
+            "message": "Sorry, we encountered an error while processing your search. Please try again.",
+            "success": False
+        }), 500
 
 def handle_product_question(question: str, session_id: str, collection_name: str):
     """Handle questions about products with category awareness"""
