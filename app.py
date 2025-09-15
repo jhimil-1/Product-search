@@ -458,58 +458,83 @@ def save_image_from_url(url, session_id):
         return None
 
 # ---------------------------
-# Debug Endpoint
+# Debug Endpoints
 # ---------------------------
-@app.route("/debug/collection/<session_id>", methods=["GET"])
-@login_required
+@app.route("/debug/category_detection", methods=["POST"])
+def debug_category_detection():
+    """Debug endpoint to test category detection"""
+    try:
+        data = request.get_json()
+        query = data.get('query', '')
+        
+        detected = detect_jewelry_category(query)
+        return jsonify({
+            "query": query,
+            "detected_categories": detected,
+            "success": True
+        })
+        
+    except Exception as e:
+        logger.error(f"Error in debug_category_detection: {str(e)}", exc_info=True)
+        return jsonify({"error": str(e), "success": False}), 500
+
+@app.route("/debug/collection/<session_id>")
 def debug_collection(session_id):
     """Debug endpoint to check collection contents"""
     try:
+        # Verify session exists
         session_data = sessions_col.find_one({"_id": session_id})
-        if not session_data:
-            return jsonify({"error": "Session not found"}), 404
+        if not session_data or 'collection_name' not in session_data:
+            return jsonify({"error": "Session not found or invalid"}), 404
             
         collection_name = session_data['collection_name']
         
-        # Get collection info
+        # Get collection info from Qdrant
         try:
             collection_info = vector_store.client.get_collection(collection_name)
-            
-            # Get a few sample points
-            sample_points = vector_store.client.scroll(
-                collection_name=collection_name,
-                limit=5,
-                with_payload=True,
-                with_vectors=False
-            )
-            
-            debug_info = {
-                "collection_name": collection_name,
-                "collection_info": {
-                    "points_count": collection_info.points_count,
-                    "vectors_count": collection_info.vectors_count if hasattr(collection_info, 'vectors_count') else "N/A"
-                },
-                "sample_products": []
-            }
-            
-            if sample_points and len(sample_points[0]) > 0:
-                for point in sample_points[0]:
-                    payload = getattr(point, 'payload', {}) or {}
-                    debug_info["sample_products"].append({
-                        "id": getattr(point, 'id', 'N/A'),
-                        "name": payload.get('name', 'N/A'),
-                        "category": payload.get('category', 'N/A'),
-                        "price": payload.get('price', 'N/A')
-                    })
-            
-            return jsonify(debug_info)
-            
         except Exception as e:
-            return jsonify({"error": f"Failed to get collection info: {str(e)}"}), 500
-            
+            return jsonify({
+                "error": f"Error getting collection info: {str(e)}",
+                "session_id": session_id,
+                "collection_name": collection_name,
+                "exists": False
+            }), 404
+        
+        # Get count of points in the collection
+        count_result = vector_store.client.count(
+            collection_name=collection_name,
+            exact=True
+        )
+        
+        # Get sample points (first 5)
+        points, _ = vector_store.client.scroll(
+            collection_name=collection_name,
+            limit=5,
+            with_vectors=False,
+            with_payload=True
+        )
+        
+        # Clean up points for JSON serialization
+        sample_points = []
+        for point in points:
+            sample_points.append({
+                "id": str(point.id) if hasattr(point, 'id') else None,
+                "payload": {k: str(v) if isinstance(v, (bytes, bytearray)) else v 
+                           for k, v in (point.payload or {}).items()}
+            })
+        
+        return jsonify({
+            "session_id": session_id,
+            "collection_name": collection_name,
+            "exists": True,
+            "vectors_count": getattr(count_result, 'count', 0) if hasattr(count_result, 'count') else 0,
+            "collection_info": str(collection_info),
+            "sample_points": sample_points
+        })
+        
     except Exception as e:
-        logger.error(f"Debug endpoint error: {str(e)}")
-        return jsonify({"error": str(e)}), 500
+        logger.error(f"Error in debug_collection: {str(e)}", exc_info=True)
+        return jsonify({"error": f"An error occurred: {str(e)}"}), 500
 
 # ---------------------------
 # Upload products
@@ -1157,9 +1182,84 @@ def handle_specific_product_query(query, session_id, collection_name):
         return jsonify({"error": "An error occurred while processing your query"}), 500
 
 
+def detect_jewelry_category(text):
+    """
+    Enhanced jewelry category detection with better accuracy
+    """
+    if not text or not isinstance(text, str):
+        return []
+        
+    text_lower = text.lower().strip()
+    
+    # Define comprehensive jewelry categories with weighted patterns
+    category_patterns = {
+        'necklace': [
+            (r'\bnecklaces?\b', 1.0),
+            (r'\bpendants?\b', 1.0),
+            (r'\bchains?\b', 0.95),
+            (r'\bchokers?\b', 1.0),
+            (r'\blockets?\b', 1.0),
+            (r'\b(?:gold|silver|diamond|pearl)\s+necklaces?\b', 1.0),
+        ],
+        'ring': [
+            (r'\brings?\b', 1.0),
+            (r'\b(?:wedding|engagement)\s+rings?\b', 1.0),
+            (r'\bbands?\b', 0.85),
+            (r'\b(?:diamond|gold|silver|platinum)\s+rings?\b', 1.0),
+        ],
+        'earring': [
+            (r'\bearrings?\b', 1.0),
+            (r'\bstuds?\b', 0.95),
+            (r'\bhoops?\b', 0.95),
+            (r'\b(?:dangle|drop|chandelier)\s+earrings?\b', 1.0),
+        ],
+        'bracelet': [
+            (r'\bbracelets?\b', 1.0),
+            (r'\bbangles?\b', 1.0),
+            (r'\bcuffs?\b', 0.9),
+            (r'\b(?:charm|tennis|chain|bead)\s+bracelets?\b', 1.0),
+        ],
+        'anklet': [
+            (r'\banklets?\b', 1.0),
+            (r'\bankle\s+(?:chains?|bracelets?)\b', 1.0),
+        ],
+        'watch': [
+            (r'\bwatches?\b', 1.0),
+            (r'\bwristwatch(?:es)?\b', 1.0),
+        ],
+        'brooch': [
+            (r'\bbrooches?\b', 1.0),
+            (r'\bpins?\b', 0.8),
+        ]
+    }
+    
+    # Calculate scores for each category
+    category_scores = {}
+    
+    for category, patterns in category_patterns.items():
+        max_score = 0.0
+        for pattern, weight in patterns:
+            matches = re.findall(pattern, text_lower, re.IGNORECASE)
+            if matches:
+                score = len(matches) * weight
+                max_score = max(max_score, score)
+        
+        if max_score > 0:
+            category_scores[category] = max_score
+    
+    # Return only the highest scoring category
+    if category_scores:
+        sorted_categories = sorted(category_scores.items(), key=lambda x: x[1], reverse=True)
+        top_category, top_score = sorted_categories[0]
+        if top_score >= 0.85:  # Confidence threshold
+            return [top_category]
+    
+    return []
+
+
 def handle_product_search(query: str, session_id: str, collection_name: str):
     """
-    Fixed product search with comprehensive debugging and error handling
+    Fixed product search with strict category enforcement
     """
     try:
         # Verify session exists
@@ -1167,9 +1267,7 @@ def handle_product_search(query: str, session_id: str, collection_name: str):
         if not session_data or 'collection_name' not in session_data:
             logger.error(f"Session not found or invalid: {session_id}")
             return jsonify({"error": "Session not found"}), 404
-        
-        logger.info(f"Processing search query: '{query}' for session: {session_id}")
-        
+            
         # Check if collection exists and has points
         try:
             collection_info = vector_store.client.get_collection(collection_name)
@@ -1186,6 +1284,73 @@ def handle_product_search(query: str, session_id: str, collection_name: str):
                 "error": f"Collection error: {str(e)}",
                 "success": False
             }), 500
+            
+        logger.info(f"Processing search query: '{query}' for session: {session_id}")
+        
+        # Detect category from query
+        detected_categories = detect_jewelry_category(query)
+        
+        # Generate embedding for the query
+        query_embedding = embed_text(query)
+        if not query_embedding:
+            return jsonify({"error": "Failed to process your query"}), 500
+        
+        # If category detected, enforce strict filtering
+        if detected_categories:
+            primary_category = detected_categories[0]
+            logger.info(f"Strict category filtering for: {primary_category}")
+            
+            # Search with category filter
+            results = vector_store.search_with_category_filter(
+                collection_name=collection_name,
+                query_vector=query_embedding,
+                categories=[primary_category],
+                top_k=20,
+                score_threshold=0.3
+            )
+            
+            # Additional client-side filtering for safety
+            filtered_results = []
+            for result in results:
+                payload = getattr(result, 'payload', {}) or {}
+                result_category = str(payload.get('category', '')).lower()
+                
+                # Strict category matching
+                if (primary_category in result_category or 
+                    f"{primary_category}s" in result_category):
+                    filtered_results.append(result)
+            
+            results = filtered_results
+        else:
+            # General search without category filtering
+            results = vector_store.search(
+                collection_name=collection_name,
+                query_vector=query_embedding,
+                top_k=15,
+                score_threshold=0.3
+            )
+        
+        # Format and return results
+        formatted_results = format_product_results(results, session_id)
+        
+        if detected_categories:
+            message = f"Here are {len(formatted_results)} {detected_categories[0].title()}s from our collection:"
+        else:
+            message = f"Found {len(formatted_results)} products matching your search:"
+        
+        return jsonify({
+            "results": formatted_results,
+            "message": message,
+            "detected_categories": detected_categories,
+            "success": True
+        })
+        
+    except Exception as e:
+        logger.error(f"Error in handle_product_search: {str(e)}", exc_info=True)
+        return jsonify({
+            "error": f"An error occurred while processing your search: {str(e)}",
+            "success": False
+        }), 500
         
         # Clean and preprocess the query
         original_query = query.strip()

@@ -2,7 +2,7 @@ from qdrant_client import QdrantClient
 from qdrant_client.http import models
 from qdrant_client.http.exceptions import UnexpectedResponse
 import logging
-from embeddings import TEXT_EMBEDDING_DIM, IMAGE_EMBEDDING_DIM, embed_text
+from embeddings import TEXT_EMBEDDING_DIM, IMAGE_EMBEDDING_DIM, embed_text, embed_text
 from typing import Optional, List, Dict, Any, Union, Tuple
 import uuid
 import base64
@@ -651,48 +651,136 @@ class VectorStore:
             logger.error(f"Error in query_similar: {str(e)}", exc_info=True)
             return []
 
-    def search_by_filter(self, collection_name: str, filter_conditions: Dict, limit: int = 10) -> List[Dict]:
+    def search_by_filter(self, collection_name: str, filter_conditions: Dict, limit: int = 10, offset: int = 0, 
+                        sort_by: str = None, sort_order: str = 'asc', with_vectors: bool = False) -> Dict[str, Any]:
         """
-        Search for points in the collection using filter conditions.
+        Search for points in the collection using filter conditions with pagination and sorting.
         
         Args:
             collection_name: Name of the collection to search in
             filter_conditions: Dictionary of field-value pairs to filter by
-            limit: Maximum number of results to return
+            limit: Maximum number of results to return (default: 10)
+            offset: Number of results to skip for pagination (default: 0)
+            sort_by: Field to sort results by (default: None for no sorting)
+            sort_order: Sort order ('asc' or 'desc', default: 'asc')
+            with_vectors: Whether to include vectors in the response (default: False)
             
         Returns:
-            List of matching points with payloads
+            Dictionary containing:
+            - results: List of matching points with payloads
+            - total: Total number of matching documents
+            - offset: Current offset for pagination
+            - limit: Maximum number of results per page
         """
         try:
             if not self.collection_exists(collection_name):
                 logger.warning(f"Collection {collection_name} does not exist")
-                return []
-                
+                return {
+                    "results": [],
+                    "total": 0,
+                    "offset": offset,
+                    "limit": limit
+                }
+            
             must_conditions = []
             
             # Convert filter conditions to Qdrant filter conditions
             if filter_conditions:
                 for field, value in filter_conditions.items():
-                    must_conditions.append(
-                        models.FieldCondition(
-                            key=field,
-                            match=models.MatchValue(value=value)
+                    if value is None:
+                        continue
+                        
+                    # Handle different types of conditions
+                    if isinstance(value, dict) and 'range' in value:
+                        # Handle range queries: {'field': {'range': {'gte': 10, 'lte': 100}}}
+                        range_conditions = []
+                        for op, op_value in value['range'].items():
+                            if op == 'gt':
+                                range_conditions.append(
+                                    models.Range(gt=op_value)
+                                )
+                            elif op == 'gte':
+                                range_conditions.append(
+                                    models.Range(gte=op_value)
+                                )
+                            elif op == 'lt':
+                                range_conditions.append(
+                                    models.Range(lt=op_value)
+                                )
+                            elif op == 'lte':
+                                range_conditions.append(
+                                    models.Range(lte=op_value)
+                                )
+                        
+                        if range_conditions:
+                            must_conditions.append(
+                                models.FieldCondition(
+                                    key=field,
+                                    range=models.Range(
+                                        gt=value['range'].get('gt'),
+                                        gte=value['range'].get('gte'),
+                                        lt=value['range'].get('lt'),
+                                        lte=value['range'].get('lte')
+                                    )
+                                )
+                            )
+                    
+                    elif isinstance(value, list):
+                        # Handle array contains: {'field': [1, 2, 3]} -> field contains any of these values
+                        must_conditions.append(
+                            models.FieldCondition(
+                                key=field,
+                                match=models.MatchAny(any=value)
+                            )
                         )
-                    )
+                    
+                    elif field == 'text':
+                        # Full-text search
+                        must_conditions.append(
+                            models.FieldCondition(
+                                key=field,
+                                match=models.MatchText(text=str(value))
+                            )
+                        )
+                    
+                    else:
+                        # Exact match by default
+                        must_conditions.append(
+                            models.FieldCondition(
+                                key=field,
+                                match=models.MatchValue(value=value)
+                            )
+                        )
             
             # Create a filter with all conditions
             filter_condition = models.Filter(must=must_conditions) if must_conditions else None
             
-            # Create a dummy text vector for the search
-            dummy_text_vector = [0.0] * TEXT_EMBEDDING_DIM
+            # Handle sorting
+            sort = None
+            if sort_by:
+                sort = [
+                    models.PayloadFieldSchema(
+                        field=sort_by,
+                        order=models.Order.DESC if sort_order.lower() == 'desc' else models.Order.ASC
+                    )
+                ]
             
-            # Perform the search
+            # Get total count first
+            count_result = self.client.count(
+                collection_name=collection_name,
+                count_filter=filter_condition
+            )
+            total = count_result.count if hasattr(count_result, 'count') else 0
+            
+            # Perform the search with pagination
             search_results = self.client.scroll(
                 collection_name=collection_name,
                 scroll_filter=filter_condition,
                 limit=limit,
-                with_vectors=False,
-                with_payload=True
+                offset=offset,
+                with_vectors=with_vectors,
+                with_payload=True,
+                order_by=sort
             )
             
             # Process results
@@ -706,23 +794,42 @@ class VectorStore:
                         if hasattr(value, 'isoformat'):  # Handle datetime
                             payload[key] = value.isoformat()
                         elif isinstance(value, (bytes, bytearray)):  # Handle binary data
-                            payload[key] = str(value)
+                            try:
+                                payload[key] = value.decode('utf-8')
+                            except (UnicodeDecodeError, AttributeError):
+                                payload[key] = str(value)
                     
-                    results.append({
+                    result_item = {
                         "id": str(hit.id) if hasattr(hit, 'id') else str(uuid.uuid4()),
                         "score": float(hit.score) if hasattr(hit, 'score') else 0.0,
                         "payload": payload
-                    })
+                    }
+                    
+                    if with_vectors and hasattr(hit, 'vector'):
+                        result_item["vector"] = hit.vector
+                    
+                    results.append(result_item)
                     
                 except Exception as e:
                     logger.error(f"Error processing search hit: {str(e)}", exc_info=True)
                     continue
             
-            return results
+            return {
+                "results": results,
+                "total": total,
+                "offset": offset,
+                "limit": limit
+            }
             
         except Exception as e:
             logger.error(f"Error in search_by_filter: {str(e)}", exc_info=True)
-            return []
+            return {
+                "results": [],
+                "total": 0,
+                "offset": offset,
+                "limit": limit,
+                "error": str(e)
+            }
 
     def search(
         self, 
@@ -941,20 +1048,20 @@ class VectorStore:
             logger.error(f"Error in search_with_name: {str(e)}", exc_info=True)
             return []
 
-    def search_with_category_filter(self, collection_name, query_vector, categories, vector_name="text", top_k=5, score_threshold=0.3):
+    def search_with_category_filter(self, collection_name, query_vector, categories, vector_name="text", top_k=10, score_threshold=0.3):
         """
-        Search for similar vectors with flexible category filtering
+        Search with strict category filtering
         
         Args:
-            collection_name: Name of the collection to search
+            collection_name: Name of the collection to search in
             query_vector: Query vector for similarity search
-            categories: List of categories to filter by (case-insensitive)
-            vector_name: Name of the vector to search ("text" or "image")
-            top_k: Number of results to return
-            score_threshold: Minimum similarity score threshold
-        
+            categories: List of category names to filter by
+            vector_name: Name of the vector field to use for search (default: 'text')
+            top_k: Number of results to return (default: 10)
+            score_threshold: Minimum similarity score (0.0-1.0)
+            
         Returns:
-            List of search results matching the category filter
+            List of search results matching the specified categories
         """
         try:
             from qdrant_client import models
@@ -977,106 +1084,21 @@ class VectorStore:
                 
             logger.info(f"Searching with category filter for: {original_categories}")
             
-            # Generate all possible category variants including common misspellings and variations
-            all_category_variants = set()
-            for category in original_categories:
-                if not category:
-                    continue
-                
-                # Base form without 's' at the end
-                base_form = category.rstrip('s') if category.endswith('s') else category
-                
-                # Add different variations
-                variants = {
-                    category,  # original
-                    base_form,  # without 's'
-                    f"{base_form}s",  # with 's'
-                    f"{base_form}es",  # for words ending with 's', 'x', 'z', 'ch', 'sh'
-                    base_form[:-1] if base_form.endswith('e') else f"{base_form}e",  # handle words ending with 'e'
-                }
-                
-                # Add common misspellings and variations
-                if 'earring' in category:
-                    variants.update({'earings', 'ear ring'})
-                elif 'bracelet' in category:
-                    variants.update({'braclet', 'bracalet'})
-                elif 'necklace' in category:
-                    variants.update({'neckless', 'neckalce'})
-                
-                # Add all variants to our set
-                all_category_variants.update(variants)
+            # First get more results than needed for better filtering
+            results = self.client.search(
+                collection_name=collection_name,
+                query_vector=(vector_name, query_vector),
+                limit=top_k * 3,  # Get more results for filtering
+                score_threshold=score_threshold,
+                with_payload=True,
+                with_vectors=False
+            )
             
-            # Remove any empty strings and ensure all are lowercase
-            all_category_variants = {v.lower() for v in all_category_variants if v and len(v) >= 2}
-            logger.info(f"Using category variants: {sorted(all_category_variants)}")
-            
-            # First, try a direct search with the original query and category filter
-            try:
-                # Create match conditions for all category variants
-                category_conditions = []
-                for variant in all_category_variants:
-                    # Exact match
-                    category_conditions.append(
-                        models.FieldCondition(
-                            key="category",
-                            match=models.MatchValue(value=variant)
-                        )
-                    )
-                    
-                    # Partial match for better recall
-                    category_conditions.append(
-                        models.FieldCondition(
-                            key="category",
-                            match=models.MatchText(text=variant)
-                        )
-                    )
-                
-                # Create the filter with OR condition for categories
-                search_filter = models.Filter(
-                    should=category_conditions,
-                    min_should_match=1
-                )
-                
-                # Perform the search with a very lenient threshold
-                search_result = self.client.search(
-                    collection_name=collection_name,
-                    query_vector=models.NamedVector(
-                        name=vector_name,
-                        vector=query_vector
-                    ) if isinstance(query_vector, list) else query_vector,
-                    query_filter=search_filter,
-                    limit=top_k * 5,  # Get more results for post-filtering
-                    score_threshold=max(0.05, score_threshold - 0.2),  # Very lenient threshold
-                    with_payload=True,
-                    with_vectors=False
-                )
-                
-                logger.info(f"Initial search returned {len(search_result)} results before category filtering")
-                
-            except Exception as e:
-                logger.warning(f"Error in initial category search: {str(e)}")
-                search_result = []
-            
-            # If no results, try a broader search without category filter
-            if not search_result:
-                logger.info("No results with category filter, trying broader search")
-                search_result = self.client.search(
-                    collection_name=collection_name,
-                    query_vector=models.NamedVector(
-                        name=vector_name,
-                        vector=query_vector
-                    ) if isinstance(query_vector, list) else query_vector,
-                    limit=top_k * 3,
-                    score_threshold=max(0.05, score_threshold - 0.15),
-                    with_payload=True,
-                    with_vectors=False
-                )
-            
-            # Post-filter results with flexible category matching
+            # Filter by category
             filtered_results = []
             seen_ids = set()
             
-            for result in search_result:
+            for result in results:
                 payload = getattr(result, 'payload', {}) or {}
                 result_id = payload.get('id')
                 
@@ -1092,57 +1114,34 @@ class VectorStore:
                     logger.debug(f"Skipping result with no category: {payload.get('name', 'Unnamed')}")
                     continue
                 
-                # Split and clean categories
-                result_categories = [cat.strip().lower() for cat in result_category.split(',') if cat.strip()]
-                
-                # Check for category matches with more flexible matching
-                is_category_match = False
-                
-                # If we didn't find anything with category filter, be more lenient
-                if not search_filter:
-                    # Check if any of the original categories are in any of the result categories
-                    for target_cat in original_categories:
-                        base_target = target_cat.rstrip('s')
-                        for result_cat in result_categories:
-                            if (target_cat in result_cat or 
-                                base_target in result_cat or
-                                any(variant in result_cat for variant in all_category_variants)):
-                                is_category_match = True
-                                break
-                        if is_category_match:
-                            break
-                else:
-                    # If we used category filter, accept all results
-                    is_category_match = True
-                
-                if is_category_match:
+                # Check if result matches any of the target categories
+                is_match = False
+                for target_category in original_categories:
+                    target_lower = target_category.lower()
+                    if (target_lower in result_category or 
+                        f"{target_lower}s" in result_category or
+                        result_category == target_lower[:-1]):  # Handles singular/plural
+                        is_match = True
+                        break
+                        
+                if is_match:
                     filtered_results.append(result)
-                    logger.debug(f"Added product to results: {payload.get('name', 'Unnamed')} with categories: {result_categories}")
-                    if len(filtered_results) >= top_k * 3:  # Get more results than needed
+                    logger.debug(f"Added product to results: {payload.get('name', 'Unnamed')} with category: {result_category}")
+                    if len(filtered_results) >= top_k:  # Stop once we have enough results
                         break
             
-            # If we still don't have enough results, include some high-scoring non-matches
-            if len(filtered_results) < top_k and search_result:
-                logger.info(f"Only found {len(filtered_results)} matching results, adding some high-scoring non-matches")
-                for result in search_result:
-                    if len(filtered_results) >= top_k * 2:  # Don't add too many
-                        break
-                    if result not in filtered_results:
-                        filtered_results.append(result)
-            
-            # Sort by score and take top_k
+            # Sort by score (highest first)
             filtered_results.sort(key=lambda x: x.score if hasattr(x, 'score') else 0, reverse=True)
-            filtered_results = filtered_results[:top_k]
             
             # Log some debug info
             if filtered_results:
                 logger.info(f"Found {len(filtered_results)} results after filtering")
-                for i, result in enumerate(filtered_results[:3], 1):
+                for i, result in enumerate(filtered_results[:min(3, len(filtered_results))], 1):
                     payload = getattr(result, 'payload', {}) or {}
                     logger.info(f"  {i}. {payload.get('name', 'Unnamed')} (score: {getattr(result, 'score', 0):.3f}, category: {payload.get('category', 'N/A')})")
             else:
                 logger.warning("No matching results found after filtering")
-            
+                
             return filtered_results
             
         except Exception as e:
