@@ -895,15 +895,18 @@ class VectorStore:
         """
         try:
             if exact_match:
-                # First try exact match with filter on name_lower for case-insensitive search
-                query_name = product_name.strip().lower()
+                # Try exact match with both name_lower and original name field
+                query_name = product_name.strip()
+                query_name_lower = query_name.lower()
+                
+                # First try exact lowercase match
                 results = self.client.scroll(
                     collection_name=collection_name,
                     scroll_filter=models.Filter(
                         must=[
                             models.FieldCondition(
                                 key="name_lower",
-                                match=models.MatchValue(value=query_name)
+                                match=models.MatchValue(value=query_name_lower)
                             )
                         ]
                     ),
@@ -913,7 +916,12 @@ class VectorStore:
                 )
                 
                 if results and len(results) > 0 and len(results[0]) > 0:
-                    return [hit.payload for hit in results[0]]
+                    # Only return items where the name matches exactly (case-insensitive)
+                    exact_matches = [
+                        hit.payload for hit in results[0]
+                        if hit.payload.get('name', '').strip().lower() == query_name_lower
+                    ]
+                    return exact_matches[:top_k] if exact_matches else []
                     
                 return []
                 
