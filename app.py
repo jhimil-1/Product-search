@@ -1,6 +1,6 @@
 from flask import Flask, request, jsonify, send_from_directory, session, redirect, url_for, make_response
 from flask_cors import CORS
-import os, uuid, json, numpy as np, base64
+import os, uuid, json, numpy as np, base64, random
 from dotenv import load_dotenv
 from embeddings import embed_text, embed_image_bytes, TEXT_EMBEDDING_DIM, IMAGE_EMBEDDING_DIM
 from vectorstore import VectorStore
@@ -847,7 +847,20 @@ def query_text():
         query_type = classify_query(query)
         logger.info(f"Query classified as: {query_type}")
         
-        if query_type == "price_query":
+        if query_type == "greeting":
+            greeting_responses = [
+                "Hello! I'm your personal jewelry shopping assistant. How can I help you today?",
+                "Hi there! Looking for something special today? I can help you find beautiful jewelry.",
+                "Greetings! I'm here to help you explore our jewelry collection. What would you like to see?",
+                "Hello! Ready to find some stunning jewelry pieces? I'm here to help!"
+            ]
+            return jsonify({
+                "message": random.choice(greeting_responses),
+                "results": [],
+                "query_type": "greeting",
+                "success": True
+            })
+        elif query_type == "price_query":
             return handle_price_query(query, session_id, collection_name)
         elif query_type == "specific_product":
             return handle_specific_product_query(query, session_id, collection_name)
@@ -878,7 +891,30 @@ def classify_query(query):
     """
     query_lower = query.lower().strip()
     
-    # Handle browsing queries first
+    # Handle greetings and small talk
+    greetings = [
+        'hi', 'hii', 'hiii', 'hiiii', 'hiiiii',  # Common variations of 'hi'
+        'hello', 'helloo', 'hellooo', 'helloooo',  # Common variations of 'hello'
+        'hey', 'heyy', 'heyyy', 'heyyyy',         # Common variations of 'hey'
+        'greetings', 'greeting',
+        'good morning', 'good afternoon', 'good evening', 'good night',
+        'how are you', 'how are you doing', 'how do you do',
+        'howdy', 'hi there', 'hello there', 'hey there',
+        "what's up", "what's new", "what's going on", "how's it going"
+    ]
+    
+    # Check if the entire query matches a greeting or starts with a greeting
+    if query_lower in greetings:
+        logger.info(f"Query '{query_lower}' exactly matches greeting list")
+        return "greeting"
+        
+    # Check if query starts with any greeting
+    for greeting in greetings:
+        if query_lower.startswith(greeting):
+            logger.info(f"Query '{query_lower}' starts with greeting: {greeting}")
+            return "greeting"
+    
+    # Handle browsing queries
     if any(word in query_lower for word in ['show me', 'display', 'list', 'browse', 'all']):
         return "general_search"
     
@@ -1386,19 +1422,15 @@ def handle_product_search(query: str, session_id: str, collection_name: str):
         detected_categories = detect_jewelry_category(search_term)
         logger.info(f"Detected categories: {detected_categories}")
         
-        if not detected_categories:
-            logger.warning(f"No specific category detected for query: '{query}'")
-            return jsonify({
-                "message": "Please specify a jewelry category (e.g., rings, necklaces, earrings, bracelets) for better search results.",
-                "results": [],
-                "success": False
-            })
-        
-        primary_category = detected_categories[0]
-        logger.info(f"Primary category: {primary_category}")
-        
-        # Generate embedding with heavy category emphasis
-        enhanced_query = f"{primary_category} {primary_category} jewelry {search_term}"
+        if detected_categories:
+            primary_category = detected_categories[0]
+            logger.info(f"Primary category detected: {primary_category}")
+            # Generate embedding with category emphasis for better relevance
+            enhanced_query = f"{primary_category} {primary_category} jewelry {search_term}"
+        else:
+            logger.info(f"No specific category detected for query: '{query}'. Performing general search.")
+            primary_category = None
+            enhanced_query = search_term
         
         # Generate embedding for the search query
         query_embedding = embed_text(enhanced_query)
@@ -1410,43 +1442,55 @@ def handle_product_search(query: str, session_id: str, collection_name: str):
         results = []
         
         try:
-            # First, try to get exact matches for the category
-            logger.info(f"Searching for products in category: {primary_category}")
-            
-            # Search with strict category filtering
-            search_results = vector_store.search(
-                collection_name=collection_name,
-                query_vector=query_embedding,
-                top_k=50,  # Get more results for filtering
-                score_threshold=0.1,  # Lower threshold to catch more potential matches
-                filter_conditions={"category": primary_category}
-            )
+            if primary_category:
+                logger.info(f"Searching for products in category: {primary_category}")
+                # Search with category filtering
+                search_results = vector_store.search(
+                    collection_name=collection_name,
+                    query_vector=query_embedding,
+                    top_k=50,  # Get more results for filtering
+                    score_threshold=0.1,  # Lower threshold to catch more potential matches
+                    filter_conditions={"category": primary_category}
+                )
+            else:
+                logger.info("Performing general search across all categories")
+                # General search without category filter
+                search_results = vector_store.search(
+                    collection_name=collection_name,
+                    query_vector=query_embedding,
+                    top_k=50,
+                    score_threshold=0.1
+                )
             
             logger.info(f"Initial search returned {len(search_results) if search_results else 0} results")
             
             # If no results, try with a more lenient search but still enforce category
             if not search_results:
                 logger.info("No results with exact category match, trying more lenient search")
-                # Get all products in the category first
-                all_in_category = vector_store.client.scroll(
-                    collection_name=collection_name,
-                    scroll_filter=models.Filter(
+                # Get all products (either in category or all products)
+                scroll_filter = None
+                if primary_category:
+                    scroll_filter = models.Filter(
                         must=[
                             models.FieldCondition(
                                 key="category",
                                 match=models.MatchValue(value=primary_category)
                             )
                         ]
-                    ),
+                    )
+                
+                all_products = vector_store.client.scroll(
+                    collection_name=collection_name,
+                    scroll_filter=scroll_filter,
                     limit=100,
                     with_vectors=False,
                     with_payload=True
                 )
                 
-                if all_in_category and hasattr(all_in_category, 'points') and all_in_category.points:
+                if all_products and hasattr(all_products, 'points') and all_products.points:
                     # Sort by similarity to query
                     search_results = sorted(
-                        all_in_category.points,
+                        all_products.points,
                         key=lambda x: (
                             -vector_store.cosine_similarity(
                                 query_embedding,
@@ -1454,7 +1498,7 @@ def handle_product_search(query: str, session_id: str, collection_name: str):
                             )
                         )
                     )
-                logger.info(f"Lenient category search returned {len(search_results) if search_results else 0} results")
+                logger.info(f"Lenient search returned {len(search_results) if search_results else 0} results")
             
             # Strict category filtering
             filtered_results = []
@@ -1480,34 +1524,37 @@ def handle_product_search(query: str, session_id: str, collection_name: str):
                     if product_id in seen_products:
                         continue
                     
-                    # STRICT CATEGORY MATCHING - More comprehensive matching
-                    is_correct_category = False
+                    # If we have a primary category, do strict matching
+                    # Otherwise, accept all results for general search
+                    is_correct_category = True  # Default to True for general search
                     
-                    # Normalize categories by removing whitespace and converting to lowercase
-                    norm_primary = primary_category.lower().strip()
-                    norm_result = result_category.lower().strip()
-                    
-                    # Check for exact match
-                    if norm_primary == norm_result:
-                        is_correct_category = True
-                    # Check for plural/singular variations
-                    elif (norm_primary + 's' == norm_result or 
-                          norm_primary == norm_result + 's' or
-                          norm_primary == norm_result.rstrip('s')):
-                        is_correct_category = True
-                    # Check for common variations (like 'earring' vs 'earrings')
-                    elif (norm_primary in ['earring', 'earrings'] and 
-                          norm_result in ['earring', 'earrings']):
-                        is_correct_category = True
-                    elif (norm_primary in ['ring', 'rings'] and 
-                          norm_result in ['ring', 'rings']):
-                        is_correct_category = True
-                    elif (norm_primary in ['bracelet', 'bracelets'] and 
-                          norm_result in ['bracelet', 'bracelets']):
-                        is_correct_category = True
-                    elif (norm_primary in ['necklace', 'necklaces'] and 
-                          norm_result in ['necklace', 'necklaces']):
-                        is_correct_category = True
+                    if primary_category:  # Only do category matching if we have a primary category
+                        is_correct_category = False
+                        # Normalize categories by removing whitespace and converting to lowercase
+                        norm_primary = primary_category.lower().strip()
+                        norm_result = result_category.lower().strip()
+                        
+                        # Check for exact match
+                        if norm_primary == norm_result:
+                            is_correct_category = True
+                        # Check for plural/singular variations
+                        elif (norm_primary + 's' == norm_result or 
+                              norm_primary == norm_result + 's' or
+                              norm_primary == norm_result.rstrip('s')):
+                            is_correct_category = True
+                        # Check for common variations (like 'earring' vs 'earrings')
+                        elif (norm_primary in ['earring', 'earrings'] and 
+                              norm_result in ['earring', 'earrings']):
+                            is_correct_category = True
+                        elif (norm_primary in ['ring', 'rings'] and 
+                              norm_result in ['ring', 'rings']):
+                            is_correct_category = True
+                        elif (norm_primary in ['bracelet', 'bracelets'] and 
+                              norm_result in ['bracelet', 'bracelets']):
+                            is_correct_category = True
+                        elif (norm_primary in ['necklace', 'necklaces'] and 
+                              norm_result in ['necklace', 'necklaces']):
+                            is_correct_category = True
                     
                     # If category doesn't match, REJECT the result
                     if not is_correct_category:
@@ -1542,11 +1589,17 @@ def handle_product_search(query: str, session_id: str, collection_name: str):
             formatted_results.sort(key=lambda x: x.get('score', 0), reverse=True)
             
             # Create response message
-            category_name = primary_category.title()
-            if any(word in query.lower() for word in ['show', 'display', 'list', 'browse']):
-                message = f"Here are {len(formatted_results)} {category_name}s from our collection:"
+            if primary_category:
+                category_name = primary_category.title()
+                if any(word in query.lower() for word in ['show', 'display', 'list', 'browse']):
+                    message = f"Here are {len(formatted_results)} {category_name}s from our collection:"
+                else:
+                    message = f"Found {len(formatted_results)} {category_name}s matching your search:"
             else:
-                message = f"Found {len(formatted_results)} {category_name}s matching your search:"
+                if any(word in query.lower() for word in ['show', 'display', 'list', 'browse']):
+                    message = f"Here are {len(formatted_results)} products from our collection:"
+                else:
+                    message = f"Found {len(formatted_results)} products matching your search:"
             
             logger.info(f"Returning {len(formatted_results)} strictly filtered results")
             
