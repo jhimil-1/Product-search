@@ -38,10 +38,14 @@ class VectorStore:
                 port=self.port,
                 api_key=self.api_key,
                 prefer_grpc=True,  # gRPC is more efficient for cloud connections
-                timeout=10.0,
+                timeout=30.0,  # Increased from 10.0 to 30.0 seconds
                 grpc_options={
-                    "grpc.keepalive_time_ms": 30000,  # Send keepalive pings every 30 seconds
-                    "grpc.keepalive_timeout_ms": 10000,  # Wait 10 seconds for keepalive response
+                    "grpc.keepalive_time_ms": 60000,  # Send keepalive pings every 60 seconds
+                    "grpc.keepalive_timeout_ms": 20000,  # Wait 20 seconds for keepalive response
+                    "grpc.max_send_message_length": 512 * 1024 * 1024,  # 512MB max message size
+                    "grpc.max_receive_message_length": 512 * 1024 * 1024,  # 512MB max message size
+                    "grpc.enable_retries": True,
+                    "grpc.service_config": '{"methodConfig": [{"name": [{"service": "qdrant"}], "timeout": "30s"}]}'
                 }
             )
             
@@ -1048,9 +1052,9 @@ class VectorStore:
             logger.error(f"Error in search_with_name: {str(e)}", exc_info=True)
             return []
 
-    def search_with_category_filter(self, collection_name, query_vector, categories, vector_name="text", top_k=10, score_threshold=0.3):
+    def search_with_category_filter(self, collection_name, query_vector, categories, vector_name="text", top_k=10, score_threshold=0.3, timeout=30.0):
         """
-        Search with strict category filtering
+        Search with strict category filtering with improved timeout handling
         
         Args:
             collection_name: Name of the collection to search in
@@ -1059,162 +1063,157 @@ class VectorStore:
             vector_name: Name of the vector field to use for search (default: 'text')
             top_k: Number of results to return (default: 10)
             score_threshold: Minimum similarity score (0.0-1.0)
+            timeout: Maximum time to wait for the search to complete in seconds (default: 30.0)
             
         Returns:
             List of search results matching the specified categories
         """
         try:
-            from qdrant_client import models
-            
+            if not query_vector:
+                logger.error("No query vector provided")
+                return []
+                
             if not categories:
-                logger.info("No categories provided, falling back to regular search")
-                return self.search(
-                    collection_name=collection_name,
-                    query_vector=query_vector,
-                    vector_name=vector_name,
-                    top_k=top_k,
-                    score_threshold=score_threshold
-                )
-            
-            # Normalize and clean categories
-            original_categories = [str(cat).lower().strip() for cat in categories if cat and str(cat).strip()]
-            if not original_categories:
-                logger.warning("No valid categories provided after normalization")
+                logger.warning("No categories provided for category filtering")
                 return []
                 
-            logger.info(f"Searching with category filter for: {original_categories}")
+            logger.info(f"Searching with category filter for: {categories}")
             
-            # First check if we have any products in the collection
-            collection_info = self.client.get_collection(collection_name=collection_name)
-            if not collection_info.points_count or collection_info.points_count == 0:
-                logger.warning(f"Collection {collection_name} is empty")
-                return []
-                
-            # Get more results than needed for better filtering
-            logger.info(f"Searching for {top_k} results with categories: {original_categories}")
-            results = self.client.search(
-                collection_name=collection_name,
-                query_vector=(vector_name, query_vector),
-                limit=min(50, top_k * 5),  # Get more results for filtering
-                score_threshold=max(0.1, score_threshold - 0.2),  # Be more lenient with score threshold
-                with_payload=True,
-                with_vectors=False
+            # Convert categories to lowercase for case-insensitive matching
+            categories = [str(cat).lower().strip() for cat in categories if cat]
+            
+            # First, try to find exact category matches in the payload
+            search_filter = models.Filter(
+                must=[
+                    models.FieldCondition(
+                        key="category",
+                        match=models.MatchAny(any=categories)
+                    )
+                ]
             )
             
-            if not results:
-                logger.warning("No results found in initial search")
-                return []
-                
-            # Filter by category
-            filtered_results = []
-            seen_ids = set()
+            logger.info(f"Searching for {top_k} results with categories: {categories}")
             
-            # Log first few results for debugging
-            logger.info(f"Found {len(results)} initial results, filtering by category")
-            for i, result in enumerate(results[:min(5, len(results))], 1):
-                payload = getattr(result, 'payload', {}) or {}
-                logger.info(f"  {i}. {payload.get('name', 'Unnamed')} (score: {getattr(result, 'score', 0):.3f}, category: {payload.get('category', 'N/A')})")
-            
-            for result in results:
-                payload = getattr(result, 'payload', {}) or {}
-                result_id = payload.get('id')
-                
-                # Skip duplicates
-                if result_id and result_id in seen_ids:
-                    continue
-                    
-                seen_ids.add(result_id)
-                result_category = str(payload.get('category', '')).lower().strip()
-                
-                # Skip if no category is available
-                if not result_category:
-                    logger.debug(f"Skipping result with no category: {payload.get('name', 'Unnamed')}")
-                    continue
-                
-                # Check if result matches any of the target categories
-                is_match = False
-                for target_category in original_categories:
-                    target_lower = target_category.lower().strip()
-                    
-                    # More lenient matching
-                    if (target_lower in result_category or 
-                        result_category in target_lower or
-                        f"{target_lower}s" in result_category or
-                        result_category == f"{target_lower}s" or
-                        result_category == target_lower[:-1] or  # Handles singular/plural
-                        target_lower == result_category[:-1] or  # Handles plural/singular
-                        any(term in result_category for term in target_lower.split()) or
-                        any(term in target_lower for term in result_category.split())):
-                        
-                        is_match = True
-                        logger.debug(f"Matched category: {result_category} to target: {target_lower}")
-                        break
-                        
-                if is_match:
-                    filtered_results.append(result)
-                    logger.info(f"Added product to results: {payload.get('name', 'Unnamed')} with category: {result_category}")
-                    if len(filtered_results) >= top_k:  # Stop once we have enough results
-                        break
-            
-            # Sort by score (highest first)
-            filtered_results.sort(key=lambda x: x.score if hasattr(x, 'score') else 0, reverse=True)
-            
-            # Log some debug info
-            if filtered_results:
-                logger.info(f"Found {len(filtered_results)} results after filtering")
-                for i, result in enumerate(filtered_results[:min(3, len(filtered_results))], 1):
-                    payload = getattr(result, 'payload', {}) or {}
-                    logger.info(f"  {i}. {payload.get('name', 'Unnamed')} (score: {getattr(result, 'score', 0):.3f}, category: {payload.get('category', 'N/A')})")
-                return filtered_results
-                
-            # If no results found, try a more lenient search
-            logger.warning("No matching results found after filtering, trying more lenient search")
-            
-            # Try with a lower score threshold and broader matching
-            results = self.client.search(
-                collection_name=collection_name,
-                query_vector=(vector_name, query_vector),
-                limit=min(100, top_k * 10),  # Get even more results
-                score_threshold=0.0,  # No score threshold
-                with_payload=True,
-                with_vectors=False
-            )
-            
-            # Try to find any product that has a category field
-            if results:
-                logger.info(f"Found {len(results)} results in lenient search")
-                for result in results:
-                    payload = getattr(result, 'payload', {}) or {}
-                    result_category = str(payload.get('category', '')).lower().strip()
-                    if result_category:
-                        logger.info(f"Found product with category: {payload.get('name', 'Unnamed')} (category: {result_category})")
-                        filtered_results.append(result)
-                        if len(filtered_results) >= top_k:
-                            break
-            
-            if not filtered_results and results:
-                # If still no results, just return the top results regardless of category
-                logger.warning("No results with categories found, returning top results")
-                return results[:top_k]
-                
-            return filtered_results[:top_k]
-            
-        except Exception as e:
-            logger.error(f"Error in category-filtered search: {str(e)}", exc_info=True)
-            # Fallback to regular search without category filter
             try:
+                # Add retry logic for timeouts
+                max_retries = 2
+                last_error = None
+                
+                for attempt in range(max_retries + 1):
+                    try:
+                        results = self.client.search(
+                            collection_name=collection_name,
+                            query_vector=(vector_name, query_vector),
+                            query_filter=search_filter,
+                            limit=min(top_k * 2, 100),  # Cap at 100 results for performance
+                            score_threshold=max(0.1, score_threshold),  # Ensure reasonable threshold
+                            with_vectors=False,
+                            with_payload=True,
+                            search_params=models.SearchParams(
+                                timeout=int(timeout * 0.9),  # Use 90% of timeout for search
+                                exact=False  # Allow approximate search for better performance
+                            )
+                        )
+                        break  # If search succeeds, exit retry loop
+                    except Exception as e:
+                        last_error = e
+                        if "deadline" in str(e).lower() and attempt < max_retries:
+                            logger.warning(f"Search timed out, retrying... (attempt {attempt + 1}/{max_retries})")
+                            continue
+                        raise  # Re-raise if not a timeout or max retries reached
+                
+                if not results:
+                    logger.warning("No results found in initial search")
+                    return []
+                
+                filtered_results = []
+                seen_ids = set()
+                
+                # Log first few results for debugging
+                logger.info(f"Found {len(results)} initial results, filtering by category")
+                for i, result in enumerate(results[:min(5, len(results))], 1):
+                    payload = getattr(result, 'payload', {}) or {}
+                    logger.info(f"  {i}. {payload.get('name', 'Unnamed')} (score: {getattr(result, 'score', 0):.3f}, category: {payload.get('category', 'N/A')}")
+                
+                # Process results
+                for result in results:
+                    try:
+                        payload = getattr(result, 'payload', {}) or {}
+                        if not payload:
+                            continue
+                            
+                        # Skip if we've already seen this ID
+                        result_id = str(getattr(result, 'id', ''))
+                        if result_id in seen_ids:
+                            continue
+                        seen_ids.add(result_id)
+                        
+                        # Get category and ensure it's a string
+                        result_category = str(payload.get('category', '')).lower().strip()
+                        if not result_category:
+                            continue
+                        
+                        # Check if category matches any of our target categories
+                        if any(cat.lower() in result_category for cat in categories):
+                            # Add to results with score and payload
+                            filtered_results.append({
+                                'id': result_id,
+                                'score': float(getattr(result, 'score', 0.0)),
+                                'payload': payload
+                            })
+                            logger.info(f"Added product to results: {payload.get('name', 'Unnamed')} with category: {result_category}")
+                            
+                            # Stop if we have enough results
+                            if len(filtered_results) >= top_k:
+                                break
+                                
+                    except Exception as e:
+                        logger.error(f"Error processing search result: {str(e)}", exc_info=True)
+                        continue
+                
+                # Sort by score in descending order
+                filtered_results.sort(key=lambda x: x['score'], reverse=True)
+                
+                # Log final results
+                logger.info(f"Found {len(filtered_results)} results after filtering")
+                for i, result in enumerate(filtered_results[:min(5, len(filtered_results))], 1):
+                    logger.info(f"  {i}. {result['payload'].get('name', 'Unnamed')} (score: {result['score']:.3f}, category: {result['payload'].get('category', 'N/A')})")
+                    
+                return [item['payload'] for item in filtered_results]
+                
+            except Exception as e:
+                logger.error(f"Error in category-filtered search: {str(e)}", exc_info=True)
                 logger.info("Falling back to regular search without category filter")
-                # Try to get any products at all
-                results = self.client.scroll(
-                    collection_name=collection_name,
-                    limit=top_k,
-                    with_payload=True,
-                    with_vectors=False
-                )
-                if results and len(results) > 0 and len(results[0]) > 0:
-                    logger.info(f"Found {len(results[0])} products in fallback search")
-                    return results[0][:top_k]
-                return []
-            except Exception as fallback_error:
-                logger.error(f"Fallback search also failed: {str(fallback_error)}", exc_info=True)
-                return []
+                
+                # Fallback to regular search if category filter fails
+                try:
+                    results = self.search(
+                        collection_name=collection_name,
+                        query_vector=query_vector,
+                        vector_name=vector_name,
+                        top_k=top_k,
+                        score_threshold=max(0.1, score_threshold - 0.2)  # Be more lenient with score threshold
+                    )
+                    logger.info(f"Found {len(results)} products in fallback search")
+                    return results
+                except Exception as fallback_error:
+                    logger.error(f"Fallback search also failed: {str(fallback_error)}", exc_info=True)
+                    # Try to get any products as a last resort
+                    try:
+                        results = self.client.scroll(
+                            collection_name=collection_name,
+                            limit=top_k,
+                            with_payload=True,
+                            with_vectors=False
+                        )
+                        if results and len(results) > 0 and len(results[0]) > 0:
+                            logger.info(f"Found {len(results[0])} products in final fallback search")
+                            return results[0][:top_k]
+                    except Exception as scroll_error:
+                        logger.error(f"Scroll search also failed: {str(scroll_error)}", exc_info=True)
+                    
+                    return []
+                    
+        except Exception as e:
+            logger.error(f"Unexpected error in search_with_category_filter: {str(e)}", exc_info=True)
+            return []

@@ -1246,12 +1246,16 @@ def handle_specific_product_query(query, session_id, collection_name):
 
 def detect_jewelry_category(text):
     """
-    Enhanced jewelry category detection with better accuracy
+    Enhanced jewelry category detection with better accuracy and single category focus
     """
     if not text or not isinstance(text, str):
         return []
         
     text_lower = text.lower().strip()
+    
+    # Special handling for tennis bracelets
+    if 'tennis' in text_lower and ('bracelet' in text_lower or 'bangle' in text_lower):
+        return ['bracelet']
     
     # Define comprehensive jewelry categories with weighted patterns
     category_patterns = {
@@ -1261,37 +1265,45 @@ def detect_jewelry_category(text):
             (r'\bchains?\b', 0.95),
             (r'\bchokers?\b', 1.0),
             (r'\blockets?\b', 1.0),
-            (r'\b(?:gold|silver|diamond|pearl)\s+necklaces?\b', 1.0),
+            (r'\bcollars?\b', 0.9),
+            (r'\b(?:gold|silver|diamond|pearl|gemstone|sapphire|ruby|emerald)\s+necklaces?\b', 1.0),
         ],
         'ring': [
             (r'\brings?\b', 1.0),
-            (r'\b(?:wedding|engagement)\s+rings?\b', 1.0),
+            (r'\b(?:wedding|engagement|eternity|promise)\s+rings?\b', 1.0),
             (r'\bbands?\b', 0.85),
-            (r'\b(?:diamond|gold|silver|platinum)\s+rings?\b', 1.0),
+            (r'\b(?:diamond|gold|silver|platinum|solitare|stackable)\s+rings?\b', 1.0),
         ],
         'earring': [
             (r'\bearrings?\b', 1.0),
             (r'\bstuds?\b', 0.95),
             (r'\bhoops?\b', 0.95),
-            (r'\b(?:dangle|drop|chandelier)\s+earrings?\b', 1.0),
+            (r'\b(?:dangle|drop|chandelier|huggie|jacket|climber|threader)\s+earrings?\b', 1.0),
+            (r'\bear\s+(?:studs?|hoops?|cuffs?)\b', 1.0),
         ],
         'bracelet': [
             (r'\bbracelets?\b', 1.0),
             (r'\bbangles?\b', 1.0),
             (r'\bcuffs?\b', 0.9),
-            (r'\b(?:charm|tennis|chain|bead)\s+bracelets?\b', 1.0),
+            (r'\b(?:charm|tennis|chain|bead|pearl|diamond|gemstone|link|chainmail)\s+bracelets?\b', 1.0),
+            (r'\b(?:bangle|cuff|charm|tennis|chain|bead|pearl|diamond|gemstone)\s+cuffs?\b', 1.0),
+            (r'\b(?:tennis|diamond|gemstone|pearl)\s+bangles?\b', 1.0),
+            (r'\bwrist\s+(?:chains?|jewelry|ornaments?)\b', 0.9),
         ],
         'anklet': [
             (r'\banklets?\b', 1.0),
             (r'\bankle\s+(?:chains?|bracelets?)\b', 1.0),
+            (r'\b(?:ankle|foot)\s+(?:chains?|jewelry|ornaments?)\b', 0.9),
         ],
         'watch': [
             (r'\bwatches?\b', 1.0),
             (r'\bwristwatch(?:es)?\b', 1.0),
+            (r'\b(?:analog|digital|automatic|mechanical|smart|luxury)\s+watches?\b', 1.0),
         ],
         'brooch': [
             (r'\bbrooches?\b', 1.0),
             (r'\bpins?\b', 0.8),
+            (r'\b(?:lapel|dress|corsage|vintage|antique|floral)\s+(?:pins?|brooches?)\b', 1.0),
         ]
     }
     
@@ -1309,13 +1321,26 @@ def detect_jewelry_category(text):
         if max_score > 0:
             category_scores[category] = max_score
     
-    # Return only the highest scoring category
+    # Return only the highest scoring category if confidence is high enough
     if category_scores:
         sorted_categories = sorted(category_scores.items(), key=lambda x: x[1], reverse=True)
         top_category, top_score = sorted_categories[0]
-        if top_score >= 0.85:  # Confidence threshold
+        
+        # If we have a clear winner with good confidence, return it
+        if top_score >= 0.8:  # Slightly lower threshold for more flexibility
+            # Special case: if bracelet is in top 2 and score is close, prefer bracelet
+            if 'bracelet' in category_scores and len(sorted_categories) > 1:
+                second_category, second_score = sorted_categories[1]
+                if (category_scores['bracelet'] >= second_score * 0.9 and 
+                    'bracelet' in [top_category, second_category]):
+                    return ['bracelet']
             return [top_category]
     
+    # Fallback: check for any bracelet-related terms with lower confidence
+    bracelet_terms = ['bracelet', 'bangle', 'cuff', 'wrist', 'tennis', 'charm', 'bead', 'chain']
+    if any(term in text_lower for term in bracelet_terms):
+        return ['bracelet']
+        
     return []
 
 
@@ -1399,17 +1424,37 @@ def handle_product_search(query: str, session_id: str, collection_name: str):
             
             logger.info(f"Initial search returned {len(search_results) if search_results else 0} results")
             
-            # If no results, try with a more lenient search
+            # If no results, try with a more lenient search but still enforce category
             if not search_results:
                 logger.info("No results with exact category match, trying more lenient search")
-                search_results = vector_store.search(
+                # Get all products in the category first
+                all_in_category = vector_store.client.scroll(
                     collection_name=collection_name,
-                    query_vector=query_embedding,
-                    top_k=100,  # Get even more results
-                    score_threshold=0.0,  # No score threshold
-                    filter_conditions={"category": {"$regex": f"{primary_category}", "$options": "i"}}
+                    scroll_filter=models.Filter(
+                        must=[
+                            models.FieldCondition(
+                                key="category",
+                                match=models.MatchValue(value=primary_category)
+                            )
+                        ]
+                    ),
+                    limit=100,
+                    with_vectors=False,
+                    with_payload=True
                 )
-                logger.info(f"Lenient search returned {len(search_results) if search_results else 0} results")
+                
+                if all_in_category and hasattr(all_in_category, 'points') and all_in_category.points:
+                    # Sort by similarity to query
+                    search_results = sorted(
+                        all_in_category.points,
+                        key=lambda x: (
+                            -vector_store.cosine_similarity(
+                                query_embedding,
+                                x.vector if hasattr(x, 'vector') else None
+                            )
+                        )
+                    )
+                logger.info(f"Lenient category search returned {len(search_results) if search_results else 0} results")
             
             # Strict category filtering
             filtered_results = []
@@ -1435,13 +1480,34 @@ def handle_product_search(query: str, session_id: str, collection_name: str):
                     if product_id in seen_products:
                         continue
                     
-                    # STRICT CATEGORY MATCHING - Only accept exact or singular/plural matches
-                    is_correct_category = (
-                        result_category == primary_category or  # Exact match
-                        result_category == f"{primary_category}s" or  # Plural form
-                        result_category == primary_category[:-1] or  # Singular form if primary is plural
-                        (primary_category.endswith('s') and result_category == primary_category[:-1])  # Handle plural/singular
-                    )
+                    # STRICT CATEGORY MATCHING - More comprehensive matching
+                    is_correct_category = False
+                    
+                    # Normalize categories by removing whitespace and converting to lowercase
+                    norm_primary = primary_category.lower().strip()
+                    norm_result = result_category.lower().strip()
+                    
+                    # Check for exact match
+                    if norm_primary == norm_result:
+                        is_correct_category = True
+                    # Check for plural/singular variations
+                    elif (norm_primary + 's' == norm_result or 
+                          norm_primary == norm_result + 's' or
+                          norm_primary == norm_result.rstrip('s')):
+                        is_correct_category = True
+                    # Check for common variations (like 'earring' vs 'earrings')
+                    elif (norm_primary in ['earring', 'earrings'] and 
+                          norm_result in ['earring', 'earrings']):
+                        is_correct_category = True
+                    elif (norm_primary in ['ring', 'rings'] and 
+                          norm_result in ['ring', 'rings']):
+                        is_correct_category = True
+                    elif (norm_primary in ['bracelet', 'bracelets'] and 
+                          norm_result in ['bracelet', 'bracelets']):
+                        is_correct_category = True
+                    elif (norm_primary in ['necklace', 'necklaces'] and 
+                          norm_result in ['necklace', 'necklaces']):
+                        is_correct_category = True
                     
                     # If category doesn't match, REJECT the result
                     if not is_correct_category:
@@ -1840,47 +1906,66 @@ def query_image(session_id):
         user_context = request.form.get('context', '').lower()
         query_text = request.form.get('query', '').lower()  # Additional query text if provided
         
-        # Priority 1: Check explicit category in the query text first
-        detected_categories = []
-        
-        # Check for explicit category mentions in the query
-        category_keywords = {
-            'ring': ['\bring\b', '\bbands?\b', '\bengagement\b', '\bwedding band\b', '\bsignet\b'],
-            'earring': ['\bearrings?\b', '\bstuds?\b', '\bhoops?\b', '\bdangle\b', '\bear rings?\b', '\bear-rings?\b'],
-            'necklace': ['\bnecklaces?\b', '\bpendants?\b', '\bchains?\b', '\bchokers?\b', '\blockets?\b', '\bcollars?\b'],
-            'bracelet': ['\bbracelets?\b', '\bbangles?\b', '\bcuffs?\b', '\bcharms?\b', '\btennis\b', '\bchain bracelets?\b'],
-            'set': ['\bsets?\b', '\bmatching sets?\b', '\bjewelry sets?\b', '\bpairs?\b']
+        # Define comprehensive category patterns with weights
+        category_patterns = {
+            'ring': [
+                (r'\brings?\b', 1.0),
+                (r'\b(?:wedding|engagement|eternity|promise|solitare|stackable|band|bands)\b', 0.9),
+                (r'\b(?:diamond|gold|silver|platinum|gemstone|wedding band|signet)\b', 0.8)
+            ],
+            'earring': [
+                (r'\bearrings?\b', 1.0),
+                (r'\b(?:studs?|hoops?|dangle|huggie|jacket|climber|threader|drop|chandelier)\b', 0.9),
+                (r'\bear[-\s]?rings?\b', 0.9)
+            ],
+            'necklace': [
+                (r'\bnecklaces?\b', 1.0),
+                (r'\b(?:pendants?|chains?|chokers?|lockets?|collars?|pandents?)\b', 0.9),
+                (r'\b(?:choker|chain|locket|pendant|collar)\b', 0.8)
+            ],
+            'bracelet': [
+                (r'\bbracelets?\b', 1.0),
+                (r'\b(?:bangles?|cuffs?|charms?|tennis|chain|bead|pearl|diamond|gemstone)\b', 0.9),
+                (r'\b(?:bangle|cuff|charm|tennis|chain|bead|pearl|diamond|gemstone)\b', 0.8)
+            ],
+            'anklet': [
+                (r'\banklets?\b', 1.0),
+                (r'\bankle\s*(?:chains?|bracelets?|jewelry|ornaments?)\b', 0.9)
+            ],
+            'brooch': [
+                (r'\bbrooch(?:es)?\b', 1.0),
+                (r'\b(?:pins?|lapel pin|dress pin|corsage|vintage brooch|antique brooch|floral brooch)\b', 0.9)
+            ]
         }
         
-        # Check query text first (highest priority)
-        for category, keywords in category_keywords.items():
-            if any(re.search(rf'\b{kw}\b', query_text) for kw in keywords):
-                detected_categories = [category]
-                logger.info(f"Detected category '{category}' from query text")
-                break
+        # Score categories based on all available context
+        context = f"{filename} {user_context} {query_text}".lower()
+        category_scores = {}
         
-        # If no category in query, check filename
+        for category, patterns in category_patterns.items():
+            score = 0
+            for pattern, weight in patterns:
+                if re.search(pattern, context):
+                    score += weight
+            if score > 0:
+                category_scores[category] = score
+        
+        # Get the top scoring category if it meets the threshold
+        detected_categories = []
+        if category_scores:
+            max_score = max(category_scores.values())
+            if max_score >= 0.8:  # Minimum confidence threshold
+                detected_categories = [cat for cat, score in category_scores.items() if score == max_score]
+                logger.info(f"Detected categories: {detected_categories} with score {max_score}")
+        
+        # Fallback to filename analysis if no category detected
         if not detected_categories and filename:
             filename_lower = filename.lower()
-            for category, keywords in category_keywords.items():
-                if any(kw in filename_lower for kw in [k.replace('\\b', '') for k in keywords]):
+            for category in category_patterns.keys():
+                if category in filename_lower:
                     detected_categories = [category]
                     logger.info(f"Detected category '{category}' from filename")
                     break
-        
-        # If still no category, check user context
-        if not detected_categories and user_context:
-            for category, keywords in category_keywords.items():
-                if any(re.search(rf'\b{kw}\b', user_context) for kw in keywords):
-                    detected_categories = [category]
-                    logger.info(f"Detected category '{category}' from user context")
-                    break
-        
-        # If still no category, use the extract_category_from_image_query as fallback
-        if not detected_categories:
-            all_context = f"{filename} {user_context} {query_text}".strip()
-            if all_context:
-                detected_categories = extract_category_from_image_query(all_context)
         
         logger.info(f"Image search context: filename='{filename}', query='{query_text}', "
                   f"user_context='{user_context}', detected_categories={detected_categories}")
@@ -1896,24 +1981,85 @@ def query_image(session_id):
             # Multi-stage search approach for better results
             results = None
             
-            # Stage 1: Always try category-filtered search first if we detected categories
-            results = None
+            # Multi-stage search with fallback
+            results = []
+            
+            # Stage 1: Strict category filtering with high threshold
             if detected_categories:
                 try:
                     logger.info(f"Stage 1: Strict category filtering for: {detected_categories}")
-                    # First try with a higher threshold for better precision
-                    # Log the exact categories we're searching for
-                    logger.info(f"Searching with strict category filter for: {detected_categories}")
                     
-                    # First try with a higher threshold for better precision
-                    results = vector_store.search_with_category_filter(
+                    # Try with a high threshold first for precision
+                    strict_results = vector_store.search_with_category_filter(
                         collection_name=collection_name,
                         query_vector=image_embedding,
                         vector_name="image",
                         categories=detected_categories,
-                        top_k=15,  # Get more results to ensure we have enough after filtering
-                        score_threshold=0.6  # Higher threshold for better precision
+                        top_k=20,  # Get more results to ensure we have enough after filtering
+                        score_threshold=0.7  # High threshold for strict matching
                     )
+                    
+                    if strict_results:
+                        logger.info(f"Found {len(strict_results)} results with strict category filter")
+                        results = strict_results
+                    
+                except Exception as e:
+                    logger.warning(f"Error in strict category search: {str(e)}")
+            
+            # Stage 2: If no results, try with a lower threshold
+            if not results and detected_categories:
+                try:
+                    logger.info("Stage 2: Relaxed category filtering")
+                    relaxed_results = vector_store.search_with_category_filter(
+                        collection_name=collection_name,
+                        query_vector=image_embedding,
+                        vector_name="image",
+                        categories=detected_categories,
+                        top_k=15,
+                        score_threshold=0.5  # Lower threshold for more results
+                    )
+                    
+                    if relaxed_results:
+                        logger.info(f"Found {len(relaxed_results)} results with relaxed category filter")
+                        results = relaxed_results
+                        
+                except Exception as e:
+                    logger.warning(f"Error in relaxed category search: {str(e)}")
+            
+            # Stage 3: If still no results, try without category filter but with high threshold
+            if not results:
+                try:
+                    logger.info("Stage 3: No category filter with high threshold")
+                    no_category_results = vector_store.search(
+                        collection_name=collection_name,
+                        query_vector=image_embedding,
+                        vector_name="image",
+                        top_k=10,
+                        score_threshold=0.7
+                    )
+                    
+                    if no_category_results:
+                        logger.info(f"Found {len(no_category_results)} results without category filter")
+                        results = no_category_results
+                        
+                except Exception as e:
+                    logger.warning(f"Error in no-category search: {str(e)}")
+            
+            # Final fallback: Get any results with no threshold
+            if not results:
+                try:
+                    logger.info("Stage 4: No filters, get any results")
+                    fallback_results = vector_store.search(
+                        collection_name=collection_name,
+                        query_vector=image_embedding,
+                        vector_name="image",
+                        top_k=5
+                    )
+                    results = fallback_results
+                    
+                except Exception as e:
+                    logger.error(f"Error in fallback search: {str(e)}")
+                    return jsonify({"error": "Failed to find any matching products"}), 404
                     
                     if results:
                         logger.info(f"Found {len(results)} results with strict category filter")
@@ -1975,23 +2121,24 @@ def query_image(session_id):
                 except Exception as e:
                     logger.warning(f"Relaxed category filter search failed: {str(e)}", exc_info=True)
             
-            # Stage 3: Last resort - search without any category filtering
+            # Stage 3: No fallback to uncategorized search - instead, return what we have or an empty result
+            # This ensures we never show results from wrong categories
             if not results:
-                logger.info("Stage 3: Fallback search without any category filtering")
-                results = vector_store.search(
-                    collection_name=collection_name,
-                    query_vector=image_embedding,
-                    vector_name="image",
-                    top_k=10,
-                    score_threshold=0.1  # Even lower threshold for broader search
-                )
+                logger.info("No results found with category filtering. Not falling back to uncategorized search.")
+                return jsonify({
+                    "message": "No matching products found in the specified category. Please try a different image or search term.",
+                    "results": []
+                })
             
-            # Stage 3: Final filtering and validation of results
+            # Final filtering and validation of results
             if results:
-                logger.info("Stage 3: Final result validation and filtering")
+                logger.info("Final result validation and filtering")
                 
                 valid_results = []
                 seen_products = set()
+                
+                # Get the primary detected category for strict matching
+                primary_category = detected_categories[0].lower() if detected_categories else None
                 
                 for result in results:
                     try:
@@ -2016,24 +2163,50 @@ def query_image(session_id):
                             
                         seen_products.add(product_key)
                         
-                        # Strict category validation if we have detected categories
+                        # Normalize the result's categories for comparison
+                        result_categories = [c.strip().lower() for c in category.split(',')]
+                        
+                        # Enforce strict category matching
                         if detected_categories:
-                            # Normalize the result's category for comparison
-                            result_categories = [c.strip().lower() for c in category.split(',')]
+                            # First check if any result category exactly matches any detected category
+                            category_match = any(
+                                any(detected_cat == result_cat 
+                                    for result_cat in result_categories)
+                                for detected_cat in detected_categories
+                            )
                             
-                            # Check if any detected category EXACTLY matches the result's categories
-                            # Only allow exact matches, not partial matches
-                            category_match = False
-                            for detected_cat in detected_categories:
-                                for result_cat in result_categories:
-                                    if detected_cat == result_cat:  # Exact match only
+                            # If no exact match, check for singular/plural variations
+                            if not category_match:
+                                for detected_cat in detected_categories:
+                                    for result_cat in result_categories:
+                                        # Check for plural/singular variations
+                                        if (detected_cat + 's' == result_cat or 
+                                            detected_cat == result_cat + 's' or
+                                            detected_cat == result_cat.rstrip('s')):
+                                            category_match = True
+                                            break
+                                    if category_match:
+                                        break
+                            
+                            # If still no match, check for category groups
+                            if not category_match:
+                                # Define category groups - items in the same group are considered matching
+                                category_groups = {
+                                    'necklace': ['necklace', 'pendant', 'choker', 'locket', 'chain', 'collar'],
+                                    'ring': ['ring', 'band', 'engagement', 'wedding', 'solitaire', 'eternity', 'stackable'],
+                                    'earring': ['earring', 'stud', 'hoop', 'dangle', 'huggie', 'earrings', 'studs', 'ear jacket', 'ear climber', 'threader'],
+                                    'bracelet': ['bracelet', 'bangle', 'cuff', 'charm', 'tennis', 'bangles', 'cuffs', 'chain bracelet', 'beaded', 'stretch', 'pearl', 'diamond', 'gemstone', 'link', 'chainmail', 'bangle bracelet', 'cuff bracelet', 'charm bracelet']
+                                }
+                                
+                                # Check if any detected category and result category are in the same group
+                                for group_name, group_terms in category_groups.items():
+                                    if (any(d in group_terms for d in detected_categories) and 
+                                        any(r in group_terms for r in result_categories)):
                                         category_match = True
                                         break
-                                if category_match:
-                                    break
                             
                             if not category_match:
-                                logger.debug(f"Skipping result - category mismatch: {category} not in {detected_categories}")
+                                logger.debug(f"Skipping result - category mismatch: {result_categories} not matching {detected_categories}")
                                 continue
                         
                         # Enhanced image validation
@@ -2079,19 +2252,10 @@ def query_image(session_id):
                 
                 if not results:
                     return jsonify({
-                        "message": "No valid products found with matching images. Please try a different search.",
+                        "message": "No matching products found in the specified category. Please try a different image or search term.",
                         "results": []
                     })
-            else:
-                # No category filtering, just take top results
-                results = results[:6] if results else []
             
-            if not results:
-                return jsonify({
-                    "message": "No visually similar products found. Try uploading a clearer image or search by text.",
-                    "results": []
-                })
-                
             # Format the results for the response
             formatted_results = format_product_results(results, session_id)
             
@@ -2144,8 +2308,37 @@ def get_image(product_id):
         collection_name = session_data['collection_name']
         logger.debug(f"Using collection: {collection_name}")
         
-        # First try to get the point directly by ID (as string)
+        # Try to convert product_id to UUID if it's numeric
         try:
+            from bson import ObjectId
+            
+            # Check if product_id is numeric and convert to UUID if needed
+            if str(product_id).isdigit():
+                logger.debug(f"Numeric ID detected, attempting to find corresponding UUID for ID: {product_id}")
+                # Search for documents with this numeric ID in their payload
+                search_results = vector_store.client.scroll(
+                    collection_name=collection_name,
+                    scroll_filter=models.Filter(
+                        must=[
+                            models.FieldCondition(
+                                key="id",
+                                match=models.MatchValue(value=int(product_id))
+                            )
+                        ]
+                    ),
+                    limit=1,
+                    with_payload=True,
+                    with_vectors=False
+                )
+                
+                if search_results and len(search_results[0]) > 0:
+                    point = search_results[0][0]
+                    payload = point.payload or {}
+                    if payload:
+                        logger.debug(f"Found product with numeric ID {product_id}, UUID: {point.id}")
+                        return _serve_image(payload, str(point.id))
+            
+            # If not numeric or not found with numeric ID, try direct lookup
             logger.debug(f"Attempting direct lookup of product ID: {product_id}")
             point = vector_store.client.retrieve(
                 collection_name=collection_name,
