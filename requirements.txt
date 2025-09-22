@@ -13,3 +13,4 @@ tqdm
 huggingface
 Flask-Session  # Added for server-side session management
 flask-cors>=4.0.0  # Added for CORS support
+flask-limiter>=3.0.0  # Added for rate limiting API endpoints

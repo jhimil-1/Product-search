@@ -37,6 +37,30 @@ class Config:
     # Model settings
     EMBEDDING_MODEL = 'all-MiniLM-L6-v2'
     
+    # API Key settings
+    WIDGET_API_KEYS = {
+        'demo_key': {
+            'name': 'Demo Key',
+            'description': 'For testing purposes only',
+            'enabled': True,
+            'permissions': ['read', 'search'],
+            'rate_limit': 100  # requests per hour
+        },
+        'premium_key': {
+            'name': 'Premium Key',
+            'description': 'For premium users',
+            'enabled': True,
+            'permissions': ['read', 'search', 'ingest'],
+            'rate_limit': 1000  # requests per hour
+        }
+    }
+    
+    # Generate a new API key (run this once and store it in .env)
+    @staticmethod
+    def generate_api_key():
+        import secrets
+        return secrets.token_urlsafe(32)
+    
     @classmethod
     def init_app(cls, app):
         # Ensure upload folder exists

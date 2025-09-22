@@ -1,6 +1,8 @@
-from flask import Flask, request, jsonify, send_from_directory, session, redirect, url_for, make_response
+from flask import Flask, request, jsonify, send_from_directory, session, redirect, url_for, make_response, render_template_string
 from flask_cors import CORS
-import os, uuid, json, numpy as np, base64, random
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+import os, uuid, json, numpy as np, base64, random, time
 from dotenv import load_dotenv
 from embeddings import embed_text, embed_image_bytes, TEXT_EMBEDDING_DIM, IMAGE_EMBEDDING_DIM
 from vectorstore import VectorStore
@@ -45,8 +47,111 @@ def generate_embedding(text):
 # ---------------------------
 # Config
 # ---------------------------
-app = Flask(__name__, static_folder="frontend", static_url_path="")
-app.secret_key = os.getenv('FLASK_SECRET_KEY', 'dev-secret-key-123')  # Change this in production
+app = Flask(__name__, static_folder='frontend/static', template_folder='frontend')
+CORS(app)
+app.secret_key = os.getenv('SECRET_KEY', 'dev-secret-key')
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max upload size
+
+# Rate limiting
+limiter = Limiter(
+    app=app,
+    key_func=get_remote_address,
+    default_limits=["200 per day", "50 per hour"],
+    storage_uri="memory://"
+)
+
+widget_configs = {}
+
+def generate_api_key():
+    """Generate a simple API key (in production, use a more secure method)"""
+    return str(uuid.uuid4())
+
+@app.route('/api/widget/config', methods=['POST'])
+@limiter.limit("5 per minute")  # Rate limit: 5 requests per minute per IP
+def create_widget_config():
+    """
+    Create a new widget configuration
+    Expected JSON:
+    {
+        'name': 'Widget Name',
+        'primary_color': '#007bff',
+        'position': 'bottom-right',  # or 'bottom-left', 'top-right', 'top-left'
+        'greeting_message': 'Hello! How can I help you?'
+    }
+    """
+    # Check for duplicate requests
+    request_id = request.headers.get('X-Request-ID')
+    if request_id and request_id in widget_configs.get('_request_cache', {}):
+        if time.time() - widget_configs['_request_cache'][request_id]['timestamp'] < 60:  # 1 minute cache
+            return jsonify(widget_configs['_request_cache'][request_id]['response'])
+    
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({"error": "No data provided"}), 400
+            
+        # Validate required fields
+        required_fields = ['name', 'primary_color', 'position', 'greeting_message']
+        if not all(field in data for field in required_fields):
+            return jsonify({"error": f"Missing required fields. Required: {', '.join(required_fields)}"}), 400
+            
+        # Generate API key for this widget
+        api_key = generate_api_key()
+        
+        # Store configuration
+        widget_configs[api_key] = {
+            'name': data.get('name', 'My Chatbot'),
+            'primary_color': data.get('primary_color', '#007bff'),
+            'position': data.get('position', 'bottom-right'),
+            'greeting_message': data.get('greeting_message', 'Hello! How can I help you?'),
+            'created_at': datetime.now(timezone.utc).isoformat(),
+            'is_active': True,
+            'last_updated': time.time()
+        }
+        
+        # Initialize request cache if it doesn't exist
+        if '_request_cache' not in widget_configs:
+            widget_configs['_request_cache'] = {}
+        
+        # Prepare response
+        response_data = {
+            'success': True,
+            'api_key': api_key,
+            'widget_code': f"""
+            <!-- Add this to your website's HTML -->
+            <div id="chatbot-widget" data-api-key="{api_key}"></div>
+            <script src="/static/js/widget.js"></script>
+            """
+        }
+        
+        # Cache the response
+        if request_id:
+            widget_configs['_request_cache'][request_id] = {
+                'timestamp': time.time(),
+                'response': response_data
+            }
+            
+            # Clean up old cache entries (older than 1 hour)
+            current_time = time.time()
+            widget_configs['_request_cache'] = {
+                k: v for k, v in widget_configs['_request_cache'].items()
+                if current_time - v['timestamp'] < 3600  # 1 hour
+            }
+        
+        return jsonify(response_data)
+        
+    except Exception as e:
+        logger.error(f"Error creating widget config: {str(e)}", exc_info=True)
+        return jsonify({"error": "Failed to create widget configuration"}), 500
+
+@app.route('/api/widget/config/<api_key>', methods=['GET'])
+def get_widget_config(api_key):
+    """Get widget configuration by API key"""
+    config = widget_configs.get(api_key)
+    if not config:
+        return jsonify({"error": "Invalid API key"}), 404
+    return jsonify(config)
+
 app.config['UPLOAD_FOLDER'] = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'uploads')
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif'}
@@ -290,6 +395,14 @@ def serve_static(path):
 @app.route('/js/<path:filename>')
 def serve_js(filename):
     return send_from_directory(os.path.join('frontend', 'js'), filename)
+
+# Serve widget script
+@app.route('/widget-embed.js')
+def serve_widget_js():
+    response = send_from_directory('frontend/static/js', 'widget_embed.js')
+    response.headers['Content-Type'] = 'application/javascript'
+    response.headers['Access-Control-Allow-Origin'] = '*'
+    return response
 
 # Serve CSS files
 @app.route('/static/css/<path:filename>')
@@ -875,6 +988,167 @@ def query_text():
             "error": "An error occurred while processing your request",
             "details": str(e)
         }), 500
+
+@app.route('/widget')
+def widget_config_page():
+    """Serve the widget configuration page"""
+    return send_from_directory('frontend', 'widget.html')
+# Widget Integration APIs
+# ---------------------------
+
+@app.route("/api/v1/widget/query-image/<session_id>", methods=["POST"])
+def widget_query_image(session_id):
+    """
+    Handle image search requests from the widget.
+    Uses API key from request headers for authentication.
+    """
+    try:
+        # Get API key from headers
+        api_key = request.headers.get('X-API-Key')
+        if not api_key:
+            logger.warning("No API key provided in request headers")
+            return jsonify({"error": "API key is required"}), 401
+            
+        logger.info(f"Processing image search request for session: {session_id}")
+        
+        # Verify API key
+        widget_config = get_widget_config(api_key)
+        if not widget_config:
+            logger.warning(f"Invalid API key provided: {api_key}")
+            return jsonify({"error": "Invalid API key"}), 401
+            
+        if 'file' not in request.files:
+            logger.warning("No file part in the request")
+            return jsonify({"error": "No file part"}), 400
+            
+        file = request.files['file']
+        if file.filename == '':
+            logger.warning("No file selected")
+            return jsonify({"error": "No selected file"}), 400
+            
+        logger.info(f"Processing file: {file.filename} for session: {session_id}")
+        
+        # Continue with the rest of the image processing
+        return process_image_search(file, session_id)
+        
+    except Exception as e:
+        logger.error(f"Error in widget_query_image: {str(e)}", exc_info=True)
+        return jsonify({"error": f"An error occurred: {str(e)}"}), 500
+
+@app.route('/api/v1/widget/ingest', methods=['POST'])
+def widget_ingest_products():
+    """
+    API endpoint to ingest products for a widget
+    Expected JSON:
+    {
+        'api_key': 'widget_api_key',
+        'products': [
+            {
+                'id': 'product1',
+                'name': 'Product Name',
+                'description': 'Product description',
+                'price': 99.99,
+                'category': 'jewelry',
+                'image_url': 'http://example.com/image.jpg',
+                'metadata': {}
+            }
+        ]
+    }
+    """
+    try:
+        data = request.get_json()
+        if not data or 'api_key' not in data or 'products' not in data:
+            return jsonify({"error": "Missing required fields: api_key and products are required"}), 400
+            
+        # Verify API key
+        if data['api_key'] not in widget_configs:
+            return jsonify({"error": "Invalid API key"}), 401
+            
+        # Process products
+        processed = 0
+        for product in data['products']:
+            try:
+                # Generate embeddings for product name and description
+                text_to_embed = f"{product.get('name', '')} {product.get('description', '')}"
+                embedding = generate_embedding(text_to_embed)
+                
+                # Store product in vector store
+                product_id = product.get('id', str(uuid.uuid4()))
+                
+                # Store in vector database
+                vector_store.upsert(
+                    collection_name=f"widget_{data['api_key']}",
+                    points=[
+                        {
+                            'id': product_id,
+                            'vector': embedding,
+                            'payload': product
+                        }
+                    ]
+                )
+                processed += 1
+                
+            except Exception as e:
+                logger.error(f"Error processing product {product.get('id', 'unknown')}: {str(e)}")
+                continue
+                
+        return jsonify({
+            "success": True,
+            "message": f"Successfully processed {processed} products",
+            "processed": processed
+        })
+        
+    except Exception as e:
+        logger.error(f"Error in widget_ingest_products: {str(e)}", exc_info=True)
+        return jsonify({"error": "Internal server error"}), 500
+
+@app.route('/api/v1/widget/query', methods=['POST'])
+def widget_query():
+    """
+    API endpoint to query products for a widget
+    Expected JSON:
+    {
+        'api_key': 'widget_api_key',
+        'query': 'blue necklace',
+        'limit': 5
+    }
+    """
+    try:
+        data = request.get_json()
+        if not data or 'api_key' not in data or 'query' not in data:
+            return jsonify({"error": "Missing required fields: api_key and query are required"}), 400
+            
+        # Verify API key
+        if data['api_key'] not in widget_configs:
+            return jsonify({"error": "Invalid API key"}), 401
+            
+        # Generate embedding for query
+        query_embedding = generate_embedding(data['query'])
+        
+        # Search in vector store
+        results = vector_store.search(
+            collection_name=f"widget_{data['api_key']}",
+            query_vector=query_embedding,
+            limit=data.get('limit', 5)
+        )
+        
+        # Format results
+        formatted_results = []
+        for result in results:
+            formatted_results.append({
+                'id': result.id,
+                'score': result.score,
+                'payload': result.payload
+            })
+            
+        return jsonify({
+            "success": True,
+            "results": formatted_results
+        })
+        
+    except Exception as e:
+        logger.error(f"Error in widget_query: {str(e)}", exc_info=True)
+        return jsonify({"error": "Internal server error"}), 500
 
 @app.route('/debug', methods=['GET'])
 def debug_endpoint():
@@ -1931,6 +2205,8 @@ def format_product_results(results, session_id):
     
     return formatted_results
 
+# Removed duplicate widget_query_image route - using the one at the top of the file
+
 @app.route("/query_image/<session_id>", methods=["POST"])
 @login_required
 def query_image(session_id):
@@ -1941,6 +2217,12 @@ def query_image(session_id):
     if file.filename == '':
         return jsonify({"error": "No selected file"}), 400
     
+    return process_image_search(file, session_id)
+
+def process_image_search(file, session_id):
+    """
+    Common function to process image search for both widget and admin interfaces
+    """
     try:
         # Read the file directly into memory instead of saving to disk
         image_data = file.read()

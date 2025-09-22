@@ -2,8 +2,59 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <title>E-commerce Chatbot Widget</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Embed Your Chatbot Widget</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
   <style>
+    body {
+      background-color: #f8f9fa;
+    }
+    .config-container {
+      max-width: 800px;
+      margin: 40px auto;
+      padding: 30px;
+      background: white;
+      border-radius: 10px;
+      box-shadow: 0 0 20px rgba(0,0,0,0.1);
+    }
+    .preview-section {
+      border: 2px dashed #dee2e6;
+      border-radius: 10px;
+      padding: 20px;
+      min-height: 300px;
+      margin-top: 30px;
+      position: relative;
+    }
+    .preview-placeholder {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      text-align: center;
+      color: #6c757d;
+      width: 100%;
+    }
+    .code-snippet {
+      background: #f8f9fa;
+      padding: 15px;
+      border-radius: 5px;
+      font-family: monospace;
+      position: relative;
+    }
+    .copy-btn {
+      position: absolute;
+      top: 5px;
+      right: 5px;
+      background: #e9ecef;
+      border: none;
+      border-radius: 3px;
+      padding: 2px 8px;
+      font-size: 12px;
+      cursor: pointer;
+    }
+    .form-label {
+      font-weight: 500;
+    }
     #chatbot-widget {
       position: fixed;
       bottom: 20px;
@@ -103,131 +154,69 @@
   </style>
 </head>
 <body>
-  <div id="chatbot-widget">
-    <div id="chatbot-header">
-      <h3 style="margin: 0;">E-commerce Assistant</h3>
-      <button class="close-btn" id="close-chatbot">×</button>
-    </div>
-    <div id="chatbot-messages"></div>
-    <div id="chatbot-input-area">
-      <input type="text" id="chatbot-input" placeholder="Type your message..." />
-      <button id="chatbot-send">Send</button>
+  <div class="container">
+    <div class="config-container">
+      <h1 class="mb-4">Configure Your Chatbot Widget</h1>
+      
+      <form id="widget-config-form">
+        <div class="row mb-4">
+          <div class="col-md-6">
+            <div class="mb-3">
+              <label for="widget-name" class="form-label">Chatbot Name</label>
+              <input type="text" class="form-control" id="widget-name" name="widget-name" value="My Store Assistant" required>
+            </div>
+            
+            <div class="mb-3">
+              <label for="primary-color" class="form-label">Primary Color</label>
+              <input type="color" class="form-control form-control-color" id="primary-color" name="primary-color" value="#4a6fa5" title="Choose a color">
+            </div>
+            
+            <div class="mb-3">
+              <label for="position" class="form-label">Widget Position</label>
+              <select class="form-select" id="position" name="position">
+                <option value="bottom-right">Bottom Right</option>
+                <option value="bottom-left">Bottom Left</option>
+                <option value="top-right">Top Right</option>
+                <option value="top-left">Top Left</option>
+              </select>
+            </div>
+            
+            <div class="mb-3">
+              <label for="greeting-message" class="form-label">Greeting Message</label>
+              <input type="text" id="greeting-message" class="form-control" placeholder="Enter greeting message" value="Hello! How can I help you today?">
+            </div>
+            
+            <div class="mb-3">
+              <label for="product-data">Product Data (JSON):</label>
+              <textarea id="product-data" class="form-control" rows="8" placeholder='Paste your product data as JSON array, e.g. [{"id": "1", "name": "Product 1", "description": "Description 1", "price": 99.99, "category": "jewelry", "image_url": "https://example.com/image1.jpg"}]'></textarea>
+              <small class="form-text text-muted">Provide your product data in JSON format for local search</small>
+            </div>
+            
+            <button type="submit" class="btn btn-primary">Generate Embed Code</button>
+          </div>
+          
+          <div class="col-md-6">
+            <div class="preview-section">
+              <div class="preview-placeholder">
+                <i class="bi bi-chat-dots" style="font-size: 2rem; margin-bottom: 10px; display: block;"></i>
+                <p>Widget preview will appear here</p>
+              </div>
+              <div id="widget-preview"></div>
+            </div>
+          </div>
+        </div>
+      </form>
+      
+      <div id="embed-code-section" class="mt-4" style="display: none;">
+        <h4>Embed Code</h4>
+        <p>Copy and paste this code into your website's HTML:</p>
+        <div class="position-relative">
+          <pre class="code-snippet" id="embed-code"></pre>
+          <button class="copy-btn" onclick="copyToClipboard()">Copy</button>
+        </div>
+      </div>
     </div>
   </div>
 
-  <script>
-    // Configuration
-    const API_BASE_URL = 'http://localhost:5000'; // Change this to your deployed URL
-    let sessionId = '';
-
-    // DOM Elements
-    const chatWidget = document.getElementById('chatbot-widget');
-    const messagesContainer = document.getElementById('chatbot-messages');
-    const inputField = document.getElementById('chatbot-input');
-    const sendButton = document.getElementById('chatbot-send');
-    const closeButton = document.getElementById('close-chatbot');
-
-    // Initialize session
-    async function initSession() {
-      try {
-        const response = await fetch(`${API_BASE_URL}/api/session`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-          },
-        });
-        const data = await response.json();
-        sessionId = data.session_id;
-        addMessage('bot', 'Hello! I\'m your e-commerce assistant. How can I help you today?');
-      } catch (error) {
-        console.error('Error initializing session:', error);
-        addMessage('bot', 'Sorry, I\'m having trouble connecting. Please try again later.');
-      }
-    }
-
-    // Add message to chat
-    function addMessage(sender, content, isProduct = false) {
-      const messageDiv = document.createElement('div');
-      messageDiv.className = `message ${sender}-message`;
-      
-      if (isProduct) {
-        // Handle product display
-        try {
-          const product = typeof content === 'string' ? JSON.parse(content) : content;
-          messageDiv.innerHTML = `
-            <div class="product-card">
-              ${product.image_url ? `<img src="${product.image_url}" class="product-image" alt="${product.name}" />` : ''}
-              <h4>${product.name || 'Product'}</h4>
-              <p>${product.price ? `$${product.price.toFixed(2)}` : 'Price not available'}</p>
-              ${product.description ? `<p>${product.description}</p>` : ''}
-            </div>
-          `;
-        } catch (e) {
-          messageDiv.textContent = content;
-        }
-      } else {
-        messageDiv.textContent = content;
-      }
-      
-      messagesContainer.appendChild(messageDiv);
-      messagesContainer.scrollTop = messagesContainer.scrollHeight;
-    }
-
-    // Send message to backend
-    async function sendMessage() {
-      const message = inputField.value.trim();
-      if (!message) return;
-      
-      // Add user message to chat
-      addMessage('user', message);
-      inputField.value = '';
-      
-      try {
-        const response = await fetch(`${API_BASE_URL}/api/query`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({
-            query: message,
-            session_id: sessionId
-          }),
-        });
-        
-        const data = await response.json();
-        
-        // Handle response
-        if (data.answer) {
-          addMessage('bot', data.answer);
-        }
-        
-        if (data.products && data.products.length > 0) {
-          data.products.forEach(product => {
-            addMessage('bot', JSON.stringify(product), true);
-          });
-        }
-        
-      } catch (error) {
-        console.error('Error sending message:', error);
-        addMessage('bot', 'Sorry, I encountered an error. Please try again.');
-      }
-    }
-
-    // Event Listeners
-    sendButton.addEventListener('click', sendMessage);
-    
-    inputField.addEventListener('keypress', (e) => {
-      if (e.key === 'Enter') {
-        sendMessage();
-      }
-    });
-    
-    closeButton.addEventListener('click', () => {
-      chatWidget.style.display = 'none';
-    });
-
-    // Initialize the chat
-    initSession();
-  </script>
-</body>
-</html>
+  <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js"></script>
+  <script src="/static/js/widget-config.js"></script>
