@@ -304,35 +304,70 @@ document.addEventListener('DOMContentLoaded', function() {
         // Simulate bot response (replace with actual API call)
         setTimeout(() => {
             const products = JSON.parse(widgetContainer.dataset.products || '[]');
-            const productMatch = products.find(p => 
-                message.toLowerCase().includes(p.name.toLowerCase()) ||
-                message.toLowerCase().includes(p.category.toLowerCase())
-            );
+            const searchTerm = message.toLowerCase();
+            
+            // Find all matching products (by name or category)
+            const searchTerms = searchTerm.split(' ').filter(term => term.length > 2);
+            
+            const matchingProducts = products.filter(p => {
+                // Check if any search term is in the product name or category
+                return searchTerms.some(term => 
+                    p.name.toLowerCase().includes(term) ||
+                    p.category.toLowerCase().includes(term) ||
+                    p.description.toLowerCase().includes(term)
+                ) || 
+                // Also check if the full search term is contained in any field
+                p.name.toLowerCase().includes(searchTerm) ||
+                p.category.toLowerCase().includes(searchTerm) ||
+                p.description.toLowerCase().includes(searchTerm);
+            });
 
-            if (productMatch) {
-                const productHtml = `
-                    <div class="product-card">
-                        <img src="${productMatch.image_url}" alt="${productMatch.name}">
-                        <h4>${productMatch.name}</h4>
-                        <p>${productMatch.description}</p>
-                        <p><strong>$${productMatch.price}</strong></p>
-                        <button onclick="alert('Added to cart: ${productMatch.name}')" 
-                                style="background: ${widgetContainer.dataset.primaryColor || '#4a6fa5'}; 
-                                       color: white; 
-                                       border: none; 
-                                       padding: 5px 10px; 
-                                       border-radius: 4px; 
-                                       cursor: pointer;">
-                            Add to Cart
-                        </button>
-                    </div>
-                `;
+            if (matchingProducts.length > 0) {
+                // Group products by category
+                const productsByCategory = matchingProducts.reduce((acc, product) => {
+                    if (!acc[product.category]) {
+                        acc[product.category] = [];
+                    }
+                    acc[product.category].push(product);
+                    return acc;
+                }, {});
+
+                // Create HTML for all matching products
+                let productsHtml = '';
+                Object.entries(productsByCategory).forEach(([category, categoryProducts]) => {
+                    productsHtml += `<h4>${category}</h4>`;
+                    productsHtml += '<div style="display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 15px; margin-bottom: 20px;">';
+                    
+                    categoryProducts.forEach(product => {
+                        productsHtml += `
+                        <div class="product-card" style="border: 1px solid #eee; padding: 10px; border-radius: 8px;">
+                            <img src="${product.image_url}" alt="${product.name}" style="width: 100%; height: 150px; object-fit: cover; border-radius: 4px;">
+                            <h5 style="margin: 8px 0 4px;">${product.name}</h5>
+                            <p style="font-size: 0.9em; color: #666; margin: 4px 0;">${product.description}</p>
+                            <p style="font-weight: bold; margin: 8px 0;">$${product.price}</p>
+                            <button onclick="alert('Added to cart: ${product.name.replace(/'/g, "\'")}')" 
+                                    style="background: ${widgetContainer.dataset.primaryColor || '#4a6fa5'}; 
+                                           color: white; 
+                                           border: none; 
+                                           padding: 6px 12px; 
+                                           border-radius: 4px; 
+                                           cursor: pointer;
+                                           width: 100%;
+                                           font-size: 0.9em;">
+                                Add to Cart
+                            </button>
+                        </div>`;
+                    });
+                    
+                    productsHtml += '</div>';
+                });
+
                 const botMessage = document.createElement('div');
                 botMessage.className = 'message bot-message';
-                botMessage.innerHTML = `I found this ${productMatch.category.toLowerCase()} for you!` + productHtml;
+                botMessage.innerHTML = `I found ${matchingProducts.length} matching items for you!` + productsHtml;
                 chatMessages.appendChild(botMessage);
             } else {
-                addMessage("I'm here to help you find the perfect jewelry. You can ask me about necklaces, rings, earrings, bangles, or bracelets!");
+                addMessage("I couldn't find any items matching your search. You can ask me about necklaces, rings, earrings, bangles, or bracelets!");
             }
             chatMessages.scrollTop = chatMessages.scrollHeight;
         }, 1000);
