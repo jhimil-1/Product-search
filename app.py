@@ -60,11 +60,30 @@ limiter = Limiter(
     storage_uri="memory://"
 )
 
+# In-memory storage for widget configs (replace with database in production)
 widget_configs = {}
 
 def generate_api_key():
     """Generate a simple API key (in production, use a more secure method)"""
-    return str(uuid.uuid4())
+    return f"widget_{uuid.uuid4().hex[:10]}"
+
+def get_widget_config(api_key):
+    """Get widget configuration by API key"""
+    # First check in-memory cache
+    if api_key in widget_configs:
+        return widget_configs[api_key]
+        
+    # If not found in cache, check database
+    try:
+        config = db.widget_configs.find_one({"api_key": api_key, "is_active": True})
+        if config:
+            # Cache the result
+            widget_configs[api_key] = config
+            return config
+        return None
+    except Exception as e:
+        logger.error(f"Error fetching widget config: {str(e)}")
+        return None
 
 @app.route('/api/widget/config', methods=['POST'])
 @limiter.limit("5 per minute")  # Rate limit: 5 requests per minute per IP
@@ -79,39 +98,35 @@ def create_widget_config():
         'greeting_message': 'Hello! How can I help you?'
     }
     """
-    # Check for duplicate requests
-    request_id = request.headers.get('X-Request-ID')
-    if request_id and request_id in widget_configs.get('_request_cache', {}):
-        if time.time() - widget_configs['_request_cache'][request_id]['timestamp'] < 60:  # 1 minute cache
-            return jsonify(widget_configs['_request_cache'][request_id]['response'])
-    
     try:
         data = request.get_json()
-        if not data:
-            return jsonify({"error": "No data provided"}), 400
+        if not data or 'name' not in data:
+            return jsonify({"error": "Missing required fields"}), 400
             
-        # Validate required fields
-        required_fields = ['name', 'primary_color', 'position', 'greeting_message']
-        if not all(field in data for field in required_fields):
-            return jsonify({"error": f"Missing required fields. Required: {', '.join(required_fields)}"}), 400
-            
-        # Generate API key for this widget
+        # Generate API key
         api_key = generate_api_key()
         
-        # Store configuration
-        widget_configs[api_key] = {
-            'name': data.get('name', 'My Chatbot'),
-            'primary_color': data.get('primary_color', '#007bff'),
+        # Create config
+        config = {
+            'api_key': api_key,
+            'name': data['name'],
+            'primary_color': data.get('primary_color', '#4a6fa5'),
             'position': data.get('position', 'bottom-right'),
             'greeting_message': data.get('greeting_message', 'Hello! How can I help you?'),
-            'created_at': datetime.now(timezone.utc).isoformat(),
+            'created_at': datetime.now(timezone.utc),
             'is_active': True,
             'last_updated': time.time()
         }
         
-        # Initialize request cache if it doesn't exist
-        if '_request_cache' not in widget_configs:
-            widget_configs['_request_cache'] = {}
+        # Save to database
+        try:
+            db.widget_configs.insert_one(config)
+        except Exception as e:
+            logger.error(f"Error saving widget config: {str(e)}")
+            return jsonify({"error": "Failed to save configuration"}), 500
+        
+        # Cache the config
+        widget_configs[api_key] = config
         
         # Prepare response
         response_data = {
@@ -119,35 +134,25 @@ def create_widget_config():
             'api_key': api_key,
             'widget_code': f"""
             <!-- Add this to your website's HTML -->
-            <div id="chatbot-widget" data-api-key="{api_key}"></div>
-            <script src="/static/js/widget.js"></script>
+            <div id="chatbot-widget" data-api-key="{api_key}" 
+                 data-primary-color="{config['primary_color']}" 
+                 data-position="{config['position']}" 
+                 data-greeting="{config['greeting_message']}">
+            </div>
+            <script src="/static/js/embed.js"></script>
             """
         }
-        
-        # Cache the response
-        if request_id:
-            widget_configs['_request_cache'][request_id] = {
-                'timestamp': time.time(),
-                'response': response_data
-            }
-            
-            # Clean up old cache entries (older than 1 hour)
-            current_time = time.time()
-            widget_configs['_request_cache'] = {
-                k: v for k, v in widget_configs['_request_cache'].items()
-                if current_time - v['timestamp'] < 3600  # 1 hour
-            }
         
         return jsonify(response_data)
         
     except Exception as e:
-        logger.error(f"Error creating widget config: {str(e)}", exc_info=True)
-        return jsonify({"error": "Failed to create widget configuration"}), 500
+        logger.error(f"Error in create_widget_config: {str(e)}", exc_info=True)
+        return jsonify({"error": "Internal server error"}), 500
 
 @app.route('/api/widget/config/<api_key>', methods=['GET'])
-def get_widget_config(api_key):
+def get_widget_config_endpoint(api_key):
     """Get widget configuration by API key"""
-    config = widget_configs.get(api_key)
+    config = get_widget_config(api_key)
     if not config:
         return jsonify({"error": "Invalid API key"}), 404
     return jsonify(config)
@@ -2801,6 +2806,51 @@ def not_found(error):
     if request.path.startswith(('/query', '/upload_products', '/query_image', '/ask_about_product', '/api/')):
         return jsonify({"error": "Endpoint not found", "status": 404}), 404
     return error, 404
+
+@app.route('/api/v1/widget/query', methods=['POST'])
+def handle_widget_query():
+    """
+    Handle widget chat messages
+    Expected JSON:
+    {
+        'api_key': 'widget_api_key',
+        'query': 'user message',
+        'session_id': 'unique_session_id'
+    }
+    """
+    try:
+        data = request.get_json()
+        if not data or 'query' not in data or 'api_key' not in data:
+            return jsonify({"error": "Missing required fields"}), 400
+            
+        # Verify API key
+        widget_config = get_widget_config(data.get('api_key'))
+        if not widget_config:
+            return jsonify({"error": "Invalid API key"}), 401
+            
+        session_id = data.get('session_id', f'session_{uuid.uuid4().hex}')
+        query = data['query'].strip()
+        
+        # Process the query (you can replace this with your actual query processing logic)
+        if 'necklace' in query.lower():
+            response = {
+                "response": "Here are some beautiful necklaces you might like!",
+                "products": [
+                    {"id": 1, "name": "Diamond Necklace", "price": 299.99, "image": "/static/images/necklace1.jpg"},
+                    {"id": 2, "name": "Pearl Necklace", "price": 199.99, "image": "/static/images/necklace2.jpg"}
+                ]
+            }
+        else:
+            response = {
+                "response": "I'm here to help you find the perfect jewelry. You can ask me about necklaces, rings, earrings, bangles, or bracelets!",
+                "products": []
+            }
+            
+        return jsonify(response)
+        
+    except Exception as e:
+        logger.error(f"Error in handle_widget_query: {str(e)}")
+        return jsonify({"error": "Internal server error"}), 500
 
 @app.errorhandler(500)
 def internal_error(error):
