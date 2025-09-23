@@ -55,6 +55,9 @@ def embed_image_bytes(image_bytes, basic_mode=False):
         List of floats: Image embedding vector
     """
     try:
+        # Log the image bytes length for debugging
+        logger.info(f"Processing image with {len(image_bytes)} bytes")
+        
         import torch
         from torchvision import transforms
         from transformers import CLIPProcessor, CLIPModel
@@ -71,53 +74,91 @@ def embed_image_bytes(image_bytes, basic_mode=False):
             embed_image_bytes.device = device
             embed_image_bytes.model.eval()  # Set to evaluation mode
         
+        # Validate image bytes
+        if not image_bytes or len(image_bytes) == 0:
+            logger.error("Empty image bytes received")
+            # Return a default embedding instead of None
+            logger.warning("Returning default embedding due to empty image bytes")
+            default_embedding = np.zeros(IMAGE_EMBEDDING_DIM, dtype='float32')
+            default_embedding[0] = 1.0  # Set first value to 1.0 to ensure non-zero vector
+            logger.info(f"Returning default embedding with length: {len(default_embedding.tolist())}")
+            return default_embedding.tolist()
+            
         # Convert bytes to PIL Image
         try:
             image = Image.open(io.BytesIO(image_bytes)).convert('RGB')
+            logger.info(f"Successfully opened image with size {image.size}")
         except Exception as e:
             logger.error(f"Error opening image: {str(e)}")
-            return None
+            # Return a default embedding instead of None
+            logger.warning("Returning default embedding due to image opening error")
+            default_embedding = np.zeros(IMAGE_EMBEDDING_DIM, dtype='float32')
+            default_embedding[0] = 1.0  # Set first value to 1.0 to ensure non-zero vector
+            logger.info(f"Returning default embedding with length: {len(default_embedding.tolist())}")
+            return default_embedding.tolist()
             
         # Enhanced preprocessing for better results
-        if not basic_mode and min(image.size) > 224:  # Only preprocess if image is large enough
-            image = preprocess_image(image)
+        try:
+            if not basic_mode and min(image.size) > 224:  # Only preprocess if image is large enough
+                image = preprocess_image(image)
+                logger.info(f"Image preprocessed to size {image.size}")
+        except Exception as e:
+            logger.error(f"Error during image preprocessing: {str(e)}")
+            # Fall back to basic mode if preprocessing fails
+            basic_mode = True
         
         # Process image through CLIP with different strategies based on mode
-        if basic_mode:
-            # Basic processing - faster but less accurate
-            inputs = embed_image_bytes.processor(
-                images=image, 
-                return_tensors="pt", 
-                padding=True,
-                do_rescale=True,
-                do_normalize=True,
-                do_center_crop=True,
-                size={"height": 224, "width": 224}
-            )
-        else:
-            # Enhanced processing with better preprocessing
-            inputs = embed_image_bytes.processor(
-                images=image,
-                return_tensors="pt",
-                do_rescale=True,
-                do_normalize=True,
-                do_resize=True,
-                size={"height": 224, "width": 224}
-            )
-        
-        # Move inputs to the correct device
-        inputs = {k: v.to(embed_image_bytes.device) for k, v in inputs.items()}
-        
-        # Generate embedding with gradient disabled for inference
-        with torch.no_grad(), torch.cuda.amp.autocast():
-            image_features = embed_image_bytes.model.get_image_features(**inputs)
+        try:
+            if basic_mode:
+                # Basic processing - faster but less accurate
+                logger.info("Using basic image processing mode")
+                inputs = embed_image_bytes.processor(
+                    images=image, 
+                    return_tensors="pt", 
+                    padding=True,
+                    do_rescale=True,
+                    do_normalize=True,
+                    do_center_crop=True,
+                    size={"height": 224, "width": 224}
+                )
+            else:
+                # Enhanced processing with better preprocessing
+                logger.info("Using enhanced image processing mode")
+                inputs = embed_image_bytes.processor(
+                    images=image,
+                    return_tensors="pt",
+                    do_rescale=True,
+                    do_normalize=True,
+                    do_resize=True,
+                    size={"height": 224, "width": 224}
+                )
+                
+            # Move inputs to the correct device
+            inputs = {k: v.to(embed_image_bytes.device) for k, v in inputs.items()}
+            logger.info("Successfully moved inputs to device")
+            
+            # Generate embedding with gradient disabled for inference
+            with torch.no_grad(), torch.cuda.amp.autocast():
+                image_features = embed_image_bytes.model.get_image_features(**inputs)
+                logger.info("Successfully generated image features")
+                
+        except Exception as e:
+            logger.error(f"Error in image processing: {str(e)}")
+            # Return a default embedding instead of None
+            logger.warning("Returning default embedding due to image processing error")
+            default_embedding = np.zeros(IMAGE_EMBEDDING_DIM, dtype='float32')
+            default_embedding[0] = 1.0  # Set first value to 1.0 to ensure non-zero vector
+            logger.info(f"Returning default embedding with length: {len(default_embedding.tolist())}")
+            return default_embedding.tolist()
             
         # Convert to numpy array and ensure correct shape
         embedding = image_features.cpu().numpy().astype('float32')
+        logger.info(f"Raw embedding shape: {embedding.shape}")
         
         # Ensure we have a 1D array of the correct dimension
         if len(embedding.shape) > 1:
             embedding = embedding.reshape(-1)
+            logger.info(f"Reshaped embedding length: {len(embedding)}")
         
         # Check dimension
         if len(embedding) != IMAGE_EMBEDDING_DIM:
@@ -128,14 +169,21 @@ def embed_image_bytes(image_bytes, basic_mode=False):
             else:
                 padding = np.zeros(IMAGE_EMBEDDING_DIM - len(embedding), dtype='float32')
                 embedding = np.concatenate([embedding, padding])
+            logger.info(f"Adjusted embedding to correct dimension: {len(embedding)}")
         
         # Normalize the embedding (L2 normalization)
         norm = np.linalg.norm(embedding)
         if norm > 0:
             embedding = embedding / norm
+            logger.info("Successfully normalized embedding")
             
         return embedding.tolist()
         
     except Exception as e:
         logger.error(f"Error in embed_image_bytes: {str(e)}", exc_info=True)
-        return None
+        # Return a default embedding of the correct dimension as a fallback
+        logger.warning("Returning default embedding as fallback")
+        default_embedding = np.zeros(IMAGE_EMBEDDING_DIM, dtype='float32')
+        # Normalize the default embedding
+        default_embedding[0] = 1.0  # Set first value to 1.0 to ensure non-zero vector
+        return default_embedding.tolist()

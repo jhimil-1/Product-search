@@ -149,7 +149,7 @@ document.addEventListener('DOMContentLoaded', function() {
             <div class="input-group">
                 <input type="text" id="user-input" placeholder="Type your message or upload an image...">
                 <div class="file-upload">
-                    <label for="image-upload" class="file-upload-label" title="Upload Image">
+                    <label for="image-upload" class="file-upload-label" title="Upload Image to Search">
                         <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                             <rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect>
                             <circle cx="8.5" cy="8.5" r="1.5"></circle>
@@ -171,8 +171,72 @@ document.addEventListener('DOMContentLoaded', function() {
     const minimizeButton = document.getElementById('minimize-chat');
     let isMinimized = false;
     
+    // Get API URL from configuration or use current origin
+    const apiUrl = widgetContainer.dataset.apiUrl || window.location.origin;
+    
+    // Get API key from widget container
+    const apiKey = widgetContainer.dataset.apiKey;
+    console.log('Widget API Key:', apiKey);
+    
     // Generate a unique session ID for the chat
-    const sessionId = 'widget-' + Math.random().toString(36).substr(2, 9);
+    let sessionId = localStorage.getItem('chatbot_session_id');
+    
+    // Function to create a widget session
+    async function createWidgetSession() {
+        try {
+            const response = await fetch(`${apiUrl}/api/v1/widget/create-session`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                    api_key: apiKey
+                })
+            });
+            
+            if (!response.ok) {
+                throw new Error(`Failed to create session: ${response.status}`);
+            }
+            
+            const data = await response.json();
+            sessionId = data.session_id;
+            localStorage.setItem('chatbot_session_id', sessionId);
+            localStorage.setItem('chatbot_session_data', JSON.stringify({
+                sessionId: sessionId,
+                createdAt: Date.now(),
+                collectionName: data.collection_name
+            }));
+            console.log('Created widget session:', sessionId);
+            return sessionId;
+        } catch (error) {
+            console.error('Error creating widget session:', error);
+            // Fallback to generating a local session ID
+            sessionId = 'widget-' + Math.random().toString(36).substr(2, 9);
+            localStorage.setItem('chatbot_session_id', sessionId);
+            return sessionId;
+        }
+    }
+    
+    // Create session if not exists
+    if (!sessionId) {
+        createWidgetSession();
+    } else {
+        // Check if session is old (older than 24 hours) and create new one
+        const sessionData = localStorage.getItem('chatbot_session_data');
+        if (sessionData) {
+            try {
+                const data = JSON.parse(sessionData);
+                const sessionAge = Date.now() - data.createdAt;
+                if (sessionAge > 24 * 60 * 60 * 1000) { // 24 hours
+                    console.log('Session is older than 24 hours, creating new session');
+                    createWidgetSession();
+                }
+            } catch (e) {
+                console.log('Invalid session data, creating new session');
+                createWidgetSession();
+            }
+        }
+    }
     
     // Function to show loading indicator
     function showLoading() {
@@ -194,7 +258,33 @@ document.addEventListener('DOMContentLoaded', function() {
     
     // Function to handle image upload and search
     async function handleImageUpload(file) {
-        if (!file) return;
+        // Get or create a session ID if not provided
+        let sessionId = localStorage.getItem('chatbot_session_id');
+        if (!sessionId) {
+            // Create a new session if one doesn't exist
+            sessionId = await createWidgetSession();
+        }
+        if (!file) {
+            console.error('No file provided');
+            addMessage('Please select an image file to upload.');
+            return;
+        }
+
+        // Validate file type
+        const validTypes = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'];
+        if (!validTypes.includes(file.type)) {
+            console.error('Invalid file type:', file.type);
+            addMessage('Please upload a valid image file (JPEG, PNG, GIF, or WebP).');
+            return;
+        }
+
+        // Validate file size (max 5MB)
+        const maxSize = 5 * 1024 * 1024; // 5MB
+        if (file.size > maxSize) {
+            console.error('File too large:', file.size, 'bytes');
+            addMessage('Image size is too large. Please upload an image smaller than 5MB.');
+            return;
+        }
         
         // Show the uploaded image in chat
         const reader = new FileReader();
@@ -205,10 +295,18 @@ document.addEventListener('DOMContentLoaded', function() {
             imgMsg.innerHTML = `
                 <div style="display: inline-block; max-width: 200px; margin-bottom: 5px;">
                     <img src="${e.target.result}" style="max-width: 100%; border-radius: 10px;" alt="Uploaded image">
+                    <div style="font-size: 12px; color: #666; margin-top: 4px;">
+                        ${file.name} (${(file.size / 1024).toFixed(1)} KB)
+                    </div>
                 </div>
             `;
             chatMessages.appendChild(imgMsg);
             chatMessages.scrollTop = chatMessages.scrollHeight;
+        };
+        reader.onerror = function() {
+            console.error('Error reading file:', reader.error);
+            addMessage('Error reading the image file. Please try another image.');
+            return;
         };
         reader.readAsDataURL(file);
         
@@ -218,71 +316,233 @@ document.addEventListener('DOMContentLoaded', function() {
         try {
             // Create form data
             const formData = new FormData();
-            formData.append('image', file);
+            formData.append('file', file); // Changed from 'image' to 'file' to match server expectation
             
             // Get API key from widget container
             const apiKey = widgetContainer.dataset.apiKey;
             console.log('Widget API Key:', apiKey);
             if (!apiKey) {
-                console.error('API key is missing from widget container');
-                throw new Error('API key is required');
+                const errorMsg = 'API key is missing from widget container';
+                console.error(errorMsg);
+                throw new Error(errorMsg);
             }
+            
+            // Show a message that we're processing the image
+            const processingMsg = document.createElement('div');
+            processingMsg.className = 'message bot-message';
+            processingMsg.textContent = 'Analyzing your image...';
+            chatMessages.appendChild(processingMsg);
+            chatMessages.scrollTop = chatMessages.scrollHeight;
             
             // Send image to server for processing
-            const response = await fetch(`/api/v1/widget/query-image/${sessionId}`, {
-                method: 'POST',
-                headers: {
-                    'X-API-Key': apiKey
-                },
-                body: formData
-            });
+            let response;
+            let responseData;
             
-            if (!response.ok) {
-                const errorText = await response.text();
-                console.error('Server error:', response.status, errorText);
-                throw new Error(`Server responded with ${response.status}: ${errorText}`);
-            }
-            
-            const data = await response.json();
-            removeLoading(loadingElement);
-            
-            if (data.error) {
-                addMessage("Sorry, I couldn't process that image. Please try again.");
-                return;
-            }
-            
-            // Display search results
-            if (data.results && data.results.length > 0) {
-                const resultsHtml = data.results.slice(0, 3).map(product => `
-                    <div class="product-card" style="margin-top: 10px;">
-                        <img src="${product.image_url}" alt="${product.name}" style="max-width: 100%; border-radius: 5px;">
-                        <h4>${product.name}</h4>
-                        <p>${product.description}</p>
-                        <p><strong>$${product.price}</strong></p>
-                        <button onclick="alert('Added to cart: ${product.name}')" 
-                                style="background: ${widgetContainer.dataset.primaryColor || '#4a6fa5'}; 
-                                       color: white; 
-                                       border: none; 
-                                       padding: 5px 10px; 
-                                       border-radius: 4px; 
-                                       cursor: pointer;">
-                            Add to Cart
-                        </button>
-                    </div>
-                `).join('');
+            try {
+                // Show a more specific loading message
+                processingMsg.innerHTML = 'Analyzing your image... This may take a moment.';
                 
-                const botMessage = document.createElement('div');
-                botMessage.className = 'message bot-message';
-                botMessage.innerHTML = `I found these similar items for you!` + resultsHtml;
-                chatMessages.appendChild(botMessage);
-            } else {
-                addMessage("I couldn't find any similar items. Try uploading a different image or describe what you're looking for.");
+                // Create the URL with session ID
+                const fullApiUrl = `${apiUrl}/api/v1/widget/query-image/${sessionId}`;
+                console.log('Making request to:', fullApiUrl);
+                
+                // Create headers with API key
+                const headers = new Headers();
+                headers.append('X-API-Key', apiKey);
+                
+                // Log the request details
+                console.log('Request method:', 'POST');
+                console.log('Request headers:', Object.fromEntries(headers));
+                console.log('Form data entries:');
+                for (let pair of formData.entries()) {
+                    console.log(pair[0] + ': ', pair[1]);
+                }
+                
+                // Make the request
+                try {
+                    response = await fetch(fullApiUrl, {
+                        method: 'POST',
+                        headers: headers,
+                        body: formData,
+                        credentials: 'same-origin',
+                        mode: 'cors' // Ensure CORS mode is enabled
+                    });
+                    
+                    console.log('Response status:', response.status, response.statusText);
+                    console.log('Response headers:', Object.fromEntries(response.headers.entries()));
+                } catch (error) {
+                    console.error('Fetch error:', error);
+                    throw new Error(`Network error: ${error.message}`);
+                }
+                
+                // Store the response text immediately since we can only read it once
+                const responseText = await response.text();
+                
+                // Log raw response for debugging (remove in production)
+                console.log('Raw response:', responseText.substring(0, 200) + (responseText.length > 200 ? '...' : ''));
+
+                // Remove the processing message
+                if (processingMsg.parentNode === chatMessages) {
+                    chatMessages.removeChild(processingMsg);
+                }
+
+                // Try to parse the response as JSON
+                try {
+                    responseData = responseText ? JSON.parse(responseText) : {};
+                    console.log('Parsed response data:', responseData);
+                } catch (e) {
+                    console.error('Failed to parse response:', responseText);
+                    throw new Error('Received an invalid response from the server. Please try again.');
+                }
+
+                if (!response.ok) {
+                    let errorMessage = 'An error occurred while processing your request.';
+                    
+                    // Handle specific error codes with user-friendly messages
+                    if (response.status === 400) {
+                        errorMessage = responseData.error || 'Invalid request. Please check the file and try again.';
+                    } else if (response.status === 401) {
+                        errorMessage = 'Authentication failed. Please refresh the page and try again.';
+                    } else if (response.status === 413) {
+                        errorMessage = 'The image is too large. Please upload an image smaller than 10MB.';
+                    } else if (response.status >= 500) {
+                        errorMessage = 'A server error occurred. Please try again later.';
+                    } else {
+                        errorMessage = responseData.error || 
+                                     responseData.message || 
+                                     response.statusText ||
+                                     `Server error (${response.status})`;
+                    }
+                    
+                    console.error('Server error:', response.status, errorMessage, responseData);
+                    throw new Error(errorMessage);
+                }
+                
+                // If we got here, the request was successful
+                const data = responseData;
+                removeLoading(loadingElement);
+                
+                // Display search results
+                if (data.results && data.results.length > 0) {
+                    const resultsHtml = data.results.slice(0, 3).map(product => {
+                        const imageUrl = product.image_url || 'https://via.placeholder.com/200x200?text=No+Image';
+                        const productName = product.name || 'Unnamed Product';
+                        const productDesc = product.description || 'No description available';
+                        const productPrice = product.price ? `$${product.price}` : 'Price not available';
+                        const safeProductName = productName.replace(/'/g, "\\'");
+                        const s = safeProductName; // Define s variable to fix the error
+                        
+                        return `
+                            <div class="product-card" style="margin: 15px 0; padding: 10px; border: 1px solid #eee; border-radius: 8px;">
+                                <img src="${imageUrl}" 
+                                     alt="${productName}" 
+                                     style="width: 100%; height: 200px; object-fit: contain; border-radius: 4px; margin-bottom: 8px;">
+                                <h4 style="margin: 8px 0; font-size: 16px;">${productName}</h4>
+                                <p style="margin: 4px 0; font-size: 14px; color: #555;">${productDesc}</p>
+                                <p style="margin: 8px 0; font-weight: bold; color: #2c3e50;">${productPrice}</p>
+                                <button onclick="alert('Added to cart: ${safeProductName}')" 
+                                        style="background: ${widgetContainer.dataset.primaryColor || '#4a6fa5'}; 
+                                               color: white; 
+                                               border: none; 
+                                               padding: 8px 16px; 
+                                               border-radius: 4px; 
+                                               cursor: pointer;
+                                               width: 100%;
+                                               font-size: 14px;
+                                               transition: background-color 0.2s;
+                                               margin-top: 5px;"
+                                        onmouseover="this.style.opacity='0.9'"
+                                        onmouseout="this.style.opacity='1'">
+                                    Add to Cart
+                                </button>
+                            </div>
+                        `;
+                    }).join('');
+                    
+                    const botMessage = document.createElement('div');
+                    botMessage.className = 'message bot-message';
+                    botMessage.innerHTML = `
+                        <div style="margin-bottom: 10px;">
+                            ${data.message || 'I found these similar items for you!'}
+                        </div>
+                        <div style="display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 15px;">
+                            ${resultsHtml}
+                        </div>
+                    `;
+                    chatMessages.appendChild(botMessage);
+                } else {
+                    addMessage(data.message || "I couldn't find any similar items. Try uploading a different image or describe what you're looking for.");
+                }
+                
+                return data;
+                
+            } catch (error) {
+                // Ensure processing message is removed in case of error
+                if (processingMsg && processingMsg.parentNode === chatMessages) {
+                    chatMessages.removeChild(processingMsg);
+                }
+                
+                // Remove loading indicator if it exists
+                if (loadingElement) {
+                    removeLoading(loadingElement);
+                }
+                
+                console.error('Image upload failed:', error);
+                
+                // Show a user-friendly error message
+                let errorMessage = 'An error occurred while processing your image. ';
+                
+                // Handle specific error cases
+                if (error.message.includes('NetworkError')) {
+                    errorMessage += 'Please check your internet connection and try again.';
+                } else if (error.message.includes('API key')) {
+                    errorMessage += 'There\'s an issue with the widget configuration. Please contact support.';
+                } else if (error.message.includes('timeout') || error.message.includes('timed out')) {
+                    errorMessage += 'The request took too long. The server might be busy. Please try again later.';
+                } else if (error.message.includes('Failed to fetch')) {
+                    errorMessage += 'Could not connect to the server. Please check your internet connection.';
+                } else {
+                    // Use the error message from the server if available
+                    errorMessage = error.message || 'Please try again with a different image.';
+                }
+                
+                // Add the error message to the chat
+                addMessage(errorMessage);
+                
+                // Optionally, log the full error to the console for debugging
+                console.error('Full error details:', {
+                    error: error,
+                    name: error.name,
+                    message: error.message,
+                    stack: error.stack
+                });
             }
             
         } catch (error) {
-            console.error('Error processing image:', error);
-            removeLoading(loadingElement);
-            addMessage("Sorry, there was an error processing your image. Please try again.");
+            // This outer catch is now just a safety net for any unhandled errors
+            console.error('Unhandled error in handleImageUpload:', error);
+            
+            // Only show a generic error message if we haven't already shown one
+            if (!chatMessages.querySelector('.error-shown')) {
+                const errorDiv = document.createElement('div');
+                errorDiv.className = 'message bot-message error-shown';
+                errorDiv.textContent = 'An unexpected error occurred. Please try again or contact support if the problem persists.';
+                chatMessages.appendChild(errorDiv);
+                chatMessages.scrollTop = chatMessages.scrollHeight;
+            }
+            
+            // Log the full error for debugging
+            console.error('Full error details:', {
+                error: error,
+                name: error.name,
+                message: error.message,
+                stack: error.stack
+            });
+        } finally {
+            // Always ensure loading is removed in case of any errors
+            if (loadingElement) {
+                removeLoading(loadingElement);
+            }
         }
     }
 
@@ -304,70 +564,35 @@ document.addEventListener('DOMContentLoaded', function() {
         // Simulate bot response (replace with actual API call)
         setTimeout(() => {
             const products = JSON.parse(widgetContainer.dataset.products || '[]');
-            const searchTerm = message.toLowerCase();
-            
-            // Find all matching products (by name or category)
-            const searchTerms = searchTerm.split(' ').filter(term => term.length > 2);
-            
-            const matchingProducts = products.filter(p => {
-                // Check if any search term is in the product name or category
-                return searchTerms.some(term => 
-                    p.name.toLowerCase().includes(term) ||
-                    p.category.toLowerCase().includes(term) ||
-                    p.description.toLowerCase().includes(term)
-                ) || 
-                // Also check if the full search term is contained in any field
-                p.name.toLowerCase().includes(searchTerm) ||
-                p.category.toLowerCase().includes(searchTerm) ||
-                p.description.toLowerCase().includes(searchTerm);
-            });
+            const productMatch = products.find(p => 
+                message.toLowerCase().includes(p.name.toLowerCase()) ||
+                message.toLowerCase().includes(p.category.toLowerCase())
+            );
 
-            if (matchingProducts.length > 0) {
-                // Group products by category
-                const productsByCategory = matchingProducts.reduce((acc, product) => {
-                    if (!acc[product.category]) {
-                        acc[product.category] = [];
-                    }
-                    acc[product.category].push(product);
-                    return acc;
-                }, {});
-
-                // Create HTML for all matching products
-                let productsHtml = '';
-                Object.entries(productsByCategory).forEach(([category, categoryProducts]) => {
-                    productsHtml += `<h4>${category}</h4>`;
-                    productsHtml += '<div style="display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 15px; margin-bottom: 20px;">';
-                    
-                    categoryProducts.forEach(product => {
-                        productsHtml += `
-                        <div class="product-card" style="border: 1px solid #eee; padding: 10px; border-radius: 8px;">
-                            <img src="${product.image_url}" alt="${product.name}" style="width: 100%; height: 150px; object-fit: cover; border-radius: 4px;">
-                            <h5 style="margin: 8px 0 4px;">${product.name}</h5>
-                            <p style="font-size: 0.9em; color: #666; margin: 4px 0;">${product.description}</p>
-                            <p style="font-weight: bold; margin: 8px 0;">$${product.price}</p>
-                            <button onclick="alert('Added to cart: ${product.name.replace(/'/g, "\'")}')" 
-                                    style="background: ${widgetContainer.dataset.primaryColor || '#4a6fa5'}; 
-                                           color: white; 
-                                           border: none; 
-                                           padding: 6px 12px; 
-                                           border-radius: 4px; 
-                                           cursor: pointer;
-                                           width: 100%;
-                                           font-size: 0.9em;">
-                                Add to Cart
-                            </button>
-                        </div>`;
-                    });
-                    
-                    productsHtml += '</div>';
-                });
-
+            if (productMatch) {
+                const productHtml = `
+                    <div class="product-card">
+                        <img src="${productMatch.image_url}" alt="${productMatch.name}">
+                        <h4>${productMatch.name}</h4>
+                        <p>${productMatch.description}</p>
+                        <p><strong>$${productMatch.price}</strong></p>
+                        <button onclick="alert('Added to cart: ${productMatch.name}')" 
+                                style="background: ${widgetContainer.dataset.primaryColor || '#4a6fa5'}; 
+                                       color: white; 
+                                       border: none; 
+                                       padding: 5px 10px; 
+                                       border-radius: 4px; 
+                                       cursor: pointer;">
+                            Add to Cart
+                        </button>
+                    </div>
+                `;
                 const botMessage = document.createElement('div');
                 botMessage.className = 'message bot-message';
-                botMessage.innerHTML = `I found ${matchingProducts.length} matching items for you!` + productsHtml;
+                botMessage.innerHTML = `I found this ${productMatch.category.toLowerCase()} for you!` + productHtml;
                 chatMessages.appendChild(botMessage);
             } else {
-                addMessage("I couldn't find any items matching your search. You can ask me about necklaces, rings, earrings, bangles, or bracelets!");
+                addMessage("I'm here to help you find the perfect jewelry. You can ask me about necklaces, rings, earrings, bangles, or bracelets!");
             }
             chatMessages.scrollTop = chatMessages.scrollHeight;
         }, 1000);
@@ -383,6 +608,12 @@ document.addEventListener('DOMContentLoaded', function() {
     imageUpload.addEventListener('change', (e) => {
         const file = e.target.files[0];
         if (file) {
+            // Get or create session ID before calling handleImageUpload
+            let sessionId = localStorage.getItem('chatbot_session_id');
+            if (!sessionId) {
+                sessionId = 'sess_' + Math.random().toString(36).substr(2, 9);
+                localStorage.setItem('chatbot_session_id', sessionId);
+            }
             handleImageUpload(file);
             // Reset the input to allow selecting the same file again
             e.target.value = '';
@@ -404,6 +635,12 @@ document.addEventListener('DOMContentLoaded', function() {
         widgetContainer.style.border = 'none';
         const file = e.dataTransfer.files[0];
         if (file && file.type.startsWith('image/')) {
+            // Get or create session ID before calling handleImageUpload
+            let sessionId = localStorage.getItem('chatbot_session_id');
+            if (!sessionId) {
+                sessionId = 'sess_' + Math.random().toString(36).substr(2, 9);
+                localStorage.setItem('chatbot_session_id', sessionId);
+            }
             handleImageUpload(file);
         }
     });
